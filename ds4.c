@@ -58612,6 +58612,11 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
         if (ok) {
             const ds4_gpu_stream_expert_table table =
                 graph_stream_expert_table_make(m, l, 0, gate_bytes, down_bytes);
+            /* Decode: RAM-tier misses run on the CPU while the GPU runs
+             * the hits.  Prefill keeps the GPU path. */
+            if (!mm)
+                ds4_gpu_qwen4_cpu_hybrid_arm(g->mixed, T, DS4_N_EMBD, DS4_N_FF_EXP, l->ffn_gate_exps->type,
+                                             l->ffn_up_exps->type, l->ffn_down_exps->type);
             ok = ds4_gpu_qwen4_stream_route(&table, g->selected, T * DS4_N_EXPERT_USED, mm,
                                             &n_expert) != 0;
         }
@@ -58703,6 +58708,12 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                            DS4_N_EMBD, shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
                                            shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0;
     }
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(__APPLE__)
+    /* The CPU's rows replace the zeros the kernels wrote for its experts. */
+    if (ok && g_qwen4_cuda_streaming)
+        ok = ds4_gpu_qwen4_cpu_hybrid_finish(g->part, DS4_N_EXPERT_USED + (shared_dense ? 0u : 1u),
+                                             DS4_N_EMBD) != 0;
+#endif
     if (ok) {
         ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit,
                                              shared_dense ? g->sh_out : NULL, g->R, g->inj, T, DS4_N_EXPERT_USED,

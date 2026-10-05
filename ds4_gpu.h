@@ -412,6 +412,17 @@ int ds4_gpu_qwen4_stream_route(
         uint32_t                           n_selected,
         int                                compact,
         uint32_t                          *n_expert_out);
+
+/* CUDA only. Hybrid decode: the next ds4_gpu_qwen4_stream_route computes
+ * the layer's RAM-tier misses on the CPU (x is the MoE input, T x K) instead
+ * of copying them to VRAM, apart from a measured share that still goes over
+ * PCIe. The GPU sees those slots as empty and writes zero rows; finish, called
+ * after the down projection and before the reduce, fills them in. Types are
+ * the routed experts' GGUF types; an unsupported shape leaves the layer on
+ * the GPU path. DS4_CPU_HYBRID=0 turns it off. */
+int ds4_gpu_qwen4_cpu_hybrid_arm(const ds4_gpu_tensor *x, uint32_t T, uint32_t K, uint32_t M,
+                                 uint32_t gate_type, uint32_t up_type, uint32_t down_type);
+int ds4_gpu_qwen4_cpu_hybrid_finish(ds4_gpu_tensor *part, uint32_t stride, uint32_t D);
 #ifdef __APPLE__
 /* The async selected-load worker registers itself so Metal cache paths never
  * wait on command buffers from that thread (they fail the load instead and

@@ -29,6 +29,7 @@
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
 #include "ds4_image.h"
+#include "ds4_cpu_experts.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -27158,26 +27159,31 @@ static cudaStream_t g_ram_tier_stream = NULL;
 
 static struct {
     uint64_t vram_hits, ram_hits, ssd_reads, ram_bytes, ssd_bytes;
+    uint64_t cpu_experts, cpu_layers;
     uint64_t passes, first_gate, report_every;
-    double ram_sec, ssd_sec;
+    double ram_sec, ssd_sec, cpu_wait_sec, pcie_frac;
     bool exit_hook;
 } g_stream_stats;
 
 static void cuda_stream_stats_print(const char *why) {
     const auto &s = g_stream_stats;
-    const uint64_t total = s.vram_hits + s.ram_hits + s.ssd_reads;
+    const uint64_t total = s.vram_hits + s.ram_hits + s.ssd_reads + s.cpu_experts;
     if (!total) return;
     fprintf(stderr,
-            "ds4: expert tiers (%s): %llu passes, %llu lookups: VRAM %.1f%%, RAM %.1f%% "
-            "(%.2f GiB, %.2f GB/s), SSD %.1f%% (%.2f GiB, %.2f GB/s)\n",
+            "ds4: expert tiers (%s): %llu passes, %llu lookups: VRAM %.1f%%, RAM->PCIe %.1f%% "
+            "(%.2f GiB, %.2f GB/s), RAM->CPU %.1f%%, SSD %.1f%% (%.2f GiB, %.2f GB/s)\n",
             why, (unsigned long long)s.passes, (unsigned long long)total,
             100.0 * (double)s.vram_hits / (double)total,
             100.0 * (double)s.ram_hits / (double)total,
             (double)s.ram_bytes / 1073741824.0,
             s.ram_sec > 0 ? (double)s.ram_bytes / s.ram_sec / 1e9 : 0.0,
+            100.0 * (double)s.cpu_experts / (double)total,
             100.0 * (double)s.ssd_reads / (double)total,
             (double)s.ssd_bytes / 1073741824.0,
             s.ssd_sec > 0 ? (double)s.ssd_bytes / s.ssd_sec / 1e9 : 0.0);
+    if (s.cpu_layers)
+        fprintf(stderr, "ds4: CPU hybrid: PCIe share now %.2f, GPU waited on CPU %.3f ms per layer\n",
+                s.pcie_frac, 1e3 * s.cpu_wait_sec / (double)s.cpu_layers);
 }
 
 static void cuda_stream_stats_at_exit(void) { cuda_stream_stats_print("exit"); }
@@ -27348,6 +27354,10 @@ static bool cuda_ram_tier_lookup(const ds4_gpu_stream_expert_table *table, uint6
     return true;
 }
 
+/* Set by the Qwen hybrid route for one call: experts marked here are left
+ * out of the slot cache because the CPU computes them. */
+static const uint8_t *g_stream_cpu_skip = NULL;
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
@@ -27469,7 +27479,9 @@ static int cuda_stream_selected_cache_begin_load(
         uint64_t ram_bytes = 0, ssd_bytes = 0;
         double ram_t0 = 0, ssd_sec = 0;
         for (size_t i = 0; i < unique.size(); i++) {
-            if (slots[i] >= 0) continue;
+            /* Experts the CPU computes this layer keep slot -1: the kernels
+             * skip them and nothing is copied. */
+            if (slots[i] >= 0 || (g_stream_cpu_skip && g_stream_cpu_skip[unique[i]])) continue;
             uint32_t victim = UINT32_MAX;
             uint64_t oldest = stamp;
             for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
@@ -34326,6 +34338,185 @@ static struct {
     const char *gate, *up, *down;
 } g_qwen4_stream_redirect;
 
+/* Hybrid decode (docs/RAM_EXPERT_TIER.md, phase 4, after Strata's CPU/GPU
+ * split). Per MoE layer the experts already in VRAM slots run on the GPU; the
+ * misses held by the pinned RAM tier are computed on the CPU pool, in place,
+ * while the GPU works; a share of the misses still goes over PCIe into slots
+ * so the slot cache keeps learning. The share adapts: when the GPU finishes
+ * first, more goes over PCIe; when the CPU finishes first, less does. */
+static struct {
+    bool init, enabled, adapt, armed, submitted;
+    double pcie_frac, carry;
+    const ds4_gpu_tensor *x;
+    ds4_cpu_expert_shape shape;
+    uint32_t T, ns;                 /* rows, routed picks per row */
+    std::vector<uint8_t> skip;
+    std::vector<ds4_cpu_expert_job> jobs;
+    std::vector<int32_t> pair;      /* selected index of each job */
+    float *host = NULL;             /* pinned: x rows, then int rows header + CPU rows */
+    uint64_t host_cap = 0;
+    float *dev_rows = NULL;         /* device staging for the CPU rows */
+    uint64_t dev_cap = 0;
+    cudaEvent_t gpu_done = NULL;
+} g_hybrid;
+
+static void cuda_hybrid_init(void) {
+    if (g_hybrid.init) return;
+    g_hybrid.init = true;
+    const char *on = getenv("DS4_CPU_HYBRID");
+    g_hybrid.enabled = !(on && !strcmp(on, "0"));
+    const char *frac = getenv("DS4_CPU_HYBRID_PCIE");
+    g_hybrid.adapt = !(frac && frac[0]);
+    g_hybrid.pcie_frac = frac && frac[0] ? std::min(1.0, std::max(0.0, atof(frac))) : 0.3;
+    g_stream_stats.pcie_frac = g_hybrid.pcie_frac;
+}
+
+extern "C" int ds4_gpu_qwen4_cpu_hybrid_arm(const ds4_gpu_tensor *x, uint32_t T, uint32_t K, uint32_t M,
+                                            uint32_t gate_type, uint32_t up_type, uint32_t down_type) {
+    cuda_hybrid_init();
+    g_hybrid.armed = false;
+    if (!g_hybrid.enabled || !g_ssd_streaming_mode || !g_ram_tier.base || !x || !T ||
+        gate_type != up_type) return 1;
+    g_hybrid.shape = {K, M, gate_type, down_type};
+    if (!ds4_cpu_experts_supported(&g_hybrid.shape) || x->bytes < (uint64_t)T * K * sizeof(float)) return 1;
+    g_hybrid.x = x;
+    g_hybrid.T = T;
+    g_hybrid.armed = true;
+    return 1;
+}
+
+static bool cuda_hybrid_ensure(uint64_t host_floats, uint64_t dev_floats) {
+    if (host_floats > g_hybrid.host_cap) {
+        if (g_hybrid.host) cudaFreeHost(g_hybrid.host);
+        g_hybrid.host = NULL;
+        g_hybrid.host_cap = 0;
+        if (!cuda_ok(cudaMallocHost((void **)&g_hybrid.host, host_floats * sizeof(float)), "hybrid host rows"))
+            return false;
+        g_hybrid.host_cap = host_floats;
+    }
+    if (dev_floats > g_hybrid.dev_cap) {
+        if (g_hybrid.dev_rows) cudaFree(g_hybrid.dev_rows);
+        g_hybrid.dev_rows = NULL;
+        g_hybrid.dev_cap = 0;
+        if (!cuda_ok(cudaMalloc((void **)&g_hybrid.dev_rows, dev_floats * sizeof(float)), "hybrid device rows"))
+            return false;
+        g_hybrid.dev_cap = dev_floats;
+    }
+    if (!g_hybrid.gpu_done &&
+        !cuda_ok(cudaEventCreateWithFlags(&g_hybrid.gpu_done, cudaEventDisableTiming), "hybrid event"))
+        return false;
+    return true;
+}
+
+/* Header of 64 ints (row indices into part), then the CPU rows. */
+static const uint32_t HYBRID_MAX_JOBS = 64;
+
+/* Splits the layer before the slot cache loads it: marks the CPU's experts in
+ * g_stream_cpu_skip and starts the pool on them. */
+static bool cuda_hybrid_plan(const ds4_gpu_stream_expert_table *table, const int32_t *ids, uint32_t n_selected) {
+    auto &h = g_hybrid;
+    if (h.submitted) { ds4_cpu_experts_wait(); h.submitted = false; }
+    const uint32_t T = h.T, K = h.shape.K;
+    if (!T || n_selected % T || n_selected > HYBRID_MAX_JOBS) return true;
+    const uint32_t NS = n_selected / T;
+    std::vector<uint32_t> count(table->n_total_expert, 0);
+    std::vector<int32_t> cand;
+    for (uint32_t i = 0; i < n_selected; i++) {
+        const int32_t e = ids[i];
+        if (e < 0 || (uint32_t)e >= table->n_total_expert) return true;
+        if (count[e]++) continue;
+        const uint64_t gate = table->gate_offset + (uint64_t)e * table->gate_expert_bytes;
+        const auto found = g_stream_expert_by_gate.find(gate);
+        if (found != g_stream_expert_by_gate.end()) {
+            const auto &slot = g_stream_expert_slots[found->second];
+            if (slot.up == table->up_offset + (uint64_t)e * table->gate_expert_bytes &&
+                slot.down == table->down_offset + (uint64_t)e * table->down_expert_bytes) continue;
+        }
+        const char *g, *u, *d;
+        if (cuda_ram_tier_lookup(table, (uint64_t)e, &g, &u, &d)) cand.push_back(e);
+    }
+    if (cand.empty()) return true;
+    /* Experts several rows share go over PCIe first: the GPU reuses a slot,
+     * the CPU would recompute per row. */
+    std::stable_sort(cand.begin(), cand.end(), [&](int32_t a, int32_t b) { return count[a] > count[b]; });
+    const double want = h.pcie_frac * (double)cand.size() + h.carry;
+    const size_t n_pcie = std::min(cand.size(), (size_t)want);
+    h.carry = want - (double)n_pcie;
+    if (n_pcie == cand.size()) return true;
+    h.skip.assign(table->n_total_expert, 0);
+    for (size_t i = n_pcie; i < cand.size(); i++) h.skip[cand[i]] = 1;
+    uint32_t n_jobs = 0;
+    for (uint32_t i = 0; i < n_selected; i++) n_jobs += h.skip[ids[i]];
+    const uint64_t x_floats = (uint64_t)T * K, rows_off = x_floats + HYBRID_MAX_JOBS;
+    if (!cuda_hybrid_ensure(rows_off + (uint64_t)HYBRID_MAX_JOBS * K, (uint64_t)HYBRID_MAX_JOBS * (K + 1)))
+        return false;
+    /* The decode stream is idle (route synchronized it): x is final. */
+    if (!cuda_ok(cudaMemcpy(h.host, h.x->ptr, x_floats * sizeof(float), cudaMemcpyDeviceToHost),
+                 "hybrid x read")) return false;
+    h.jobs.resize(n_jobs);
+    h.pair.resize(n_jobs);
+    float *rows = h.host + rows_off;
+    for (uint32_t i = 0, j = 0; i < n_selected; i++) {
+        const int32_t e = ids[i];
+        if (!h.skip[e]) continue;
+        const char *g, *u, *d;
+        cuda_ram_tier_lookup(table, (uint64_t)e, &g, &u, &d);
+        h.jobs[j] = {g, u, d, h.host + (uint64_t)(i / NS) * K, rows + (uint64_t)j * K};
+        h.pair[j] = (int32_t)i;
+        j++;
+    }
+    if (!ds4_cpu_experts_submit(&h.shape, h.jobs.data(), n_jobs)) {
+        h.skip.clear();
+        return true;
+    }
+    h.submitted = true;
+    h.ns = NS;
+    g_stream_stats.cpu_experts += cand.size() - n_pcie;
+    g_stream_cpu_skip = h.skip.data();
+    return true;
+}
+
+__global__ void hybrid_scatter(float *part, const float *rows, const int *pair,
+                               unsigned NS, unsigned stride, unsigned D) {
+    const unsigned d = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y;
+    if (d >= D) return;
+    const unsigned i = (unsigned)pair[j], t = i / NS, s = i % NS;
+    part[((uint64_t)t * stride + s) * D + d] = rows[(uint64_t)j * D + d];
+}
+
+extern "C" int ds4_gpu_qwen4_cpu_hybrid_finish(ds4_gpu_tensor *part, uint32_t stride, uint32_t D) {
+    auto &h = g_hybrid;
+    if (!h.submitted) return 1;
+    h.submitted = false;
+    const uint32_t n_jobs = (uint32_t)h.jobs.size(), K = h.shape.K;
+    cudaStream_t s = cuda_decode_stream();
+    /* Everything the GPU had for this layer is queued: mark its end. */
+    if (!cuda_ok(cudaEventRecord(h.gpu_done, s), "hybrid GPU mark")) return 0;
+    g_stream_stats.cpu_wait_sec += ds4_cpu_experts_wait();
+    g_stream_stats.cpu_layers++;
+    if (h.adapt) {
+        /* GPU still busy: the CPU has room for more. GPU idle: it waited. */
+        const cudaError_t q = cudaEventQuery(h.gpu_done);
+        if (q == cudaErrorNotReady) h.pcie_frac = std::max(0.0, h.pcie_frac - 0.01);
+        else if (q == cudaSuccess) h.pcie_frac = std::min(0.95, h.pcie_frac + 0.01);
+        else return cuda_ok(q, "hybrid GPU query");
+        g_stream_stats.pcie_frac = h.pcie_frac;
+    }
+    if (D != K || !part || part->bytes < (uint64_t)h.T * stride * D * sizeof(float)) {
+        fprintf(stderr, "ds4: CPU hybrid rows do not fit the MoE part tensor\n");
+        return 0;
+    }
+    /* One copy (row indices, then rows) and one scatter kernel. */
+    int *hdr = (int *)(h.host + (uint64_t)h.T * K);
+    for (uint32_t j = 0; j < n_jobs; j++) hdr[j] = h.pair[j];
+    const uint64_t bytes = ((uint64_t)HYBRID_MAX_JOBS + (uint64_t)n_jobs * K) * sizeof(float);
+    if (!cuda_ok(cudaMemcpyAsync(h.dev_rows, hdr, bytes, cudaMemcpyHostToDevice, s), "hybrid rows copy"))
+        return 0;
+    hybrid_scatter<<<dim3((D + 255) / 256, n_jobs), 256, 0, s>>>((float *)part->ptr,
+        h.dev_rows + HYBRID_MAX_JOBS, (const int *)h.dev_rows, h.ns, stride, D);
+    return cuda_ok(cudaGetLastError(), "hybrid scatter");
+}
+
 extern "C" int ds4_gpu_qwen4_stream_route(const ds4_gpu_stream_expert_table *table,
         ds4_gpu_tensor *selected, uint32_t n_selected, int compact, uint32_t *n_expert_out) {
     g_qwen4_stream_redirect.valid = 0;
@@ -34336,8 +34527,13 @@ extern "C" int ds4_gpu_qwen4_stream_route(const ds4_gpu_stream_expert_table *tab
     try { ids.resize(n_selected); } catch (...) { return 0; }
     if (!cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "Qwen route wait") ||
         !cuda_ok(cudaMemcpy(ids.data(), selected->ptr, (size_t)n_selected * sizeof(int32_t),
-                            cudaMemcpyDeviceToHost), "Qwen streaming selected-id read") ||
-        !cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected)) return 0;
+                            cudaMemcpyDeviceToHost), "Qwen streaming selected-id read")) return 0;
+    const bool hybrid = g_hybrid.armed && !compact;
+    g_hybrid.armed = false;
+    if (hybrid && !cuda_hybrid_plan(table, ids.data(), n_selected)) return 0;
+    const int loaded = cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected);
+    g_stream_cpu_skip = NULL;
+    if (!loaded) return 0;
     auto &cache = g_stream_selected_cache;
     auto &r = g_qwen4_stream_redirect;
     r.gate_offset = table->gate_offset;
