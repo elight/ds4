@@ -5248,6 +5248,36 @@ static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
 }
 #endif
 
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(__APPLE__)
+/* Every routed layer, the MTP layer last, goes to the pinned RAM tier in
+ * order until the budget runs out. */
+static bool qwen4_ram_expert_tier_init(const ds4_model *model, const ds4_weights *weights,
+                                       const ds4_engine_options *opt) {
+    uint64_t budget = UINT64_MAX;
+    const char *env = getenv("DS4_RAM_EXPERT_CACHE");
+    if (opt->ram_expert_cache_set) {
+        budget = opt->ram_expert_cache_bytes;
+    } else if (env && env[0] && !ds4_parse_ram_expert_cache_arg(env, &budget)) {
+        fprintf(stderr, "ds4: DS4_RAM_EXPERT_CACHE must be auto, 0, <number>GB or <number>MB\n");
+        return false;
+    }
+    if (budget == 0) {
+        fprintf(stderr, "ds4: RAM expert tier off\n");
+        return true;
+    }
+    ds4_gpu_stream_expert_table tables[DS4_MAX_LAYER];
+    uint32_t n = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        uint64_t gate_bytes = 0, down_bytes = 0;
+        if (!l->ffn_up_exps || !streaming_layer_gate_down_expert_bytes(l, &gate_bytes, &down_bytes))
+            continue;
+        tables[n++] = graph_stream_expert_table_make(model, l, il, gate_bytes, down_bytes);
+    }
+    return ds4_gpu_ram_expert_tier_init(tables, n, budget) != 0;
+}
+#endif
+
 static uint64_t ds4_streaming_manual_cache_safe_bytes(
         ds4_backend backend,
         int         ctx_size,
@@ -6979,6 +7009,8 @@ static void config_read_qwen4_u64_array(
 static float g_qwen4_rope_freq[32];
 static float g_qwen4_rope_mscale = 1.0f;
 static uint32_t g_qwen4_native_ctx = 0;
+/* Qwen on CUDA with --ssd-streaming: routed experts go through the slot cache. */
+static bool g_qwen4_cuda_streaming = false;
 static bool g_qwen4_rope_yarn = false;
 
 /* Rotary inverse frequencies of the DS4_N_ROT/2 pairs.  DS4_QWEN4_YARN_FACTOR=f
@@ -58570,14 +58602,29 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
         qwen4_expert_type_has_mm(l->ffn_down_exps->type) &&
         qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
         qwen4_graph_dense_ok(l->ffn_down_shexp);
+    uint32_t n_expert = DS4_N_EXPERT;
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(__APPLE__)
+    /* Streaming: page this layer's picks into VRAM and point the kernels at
+     * the cache, which renumbers the experts they index. */
+    if (ok && g_qwen4_cuda_streaming) {
+        uint64_t gate_bytes = 0, down_bytes = 0;
+        ok = streaming_layer_gate_down_expert_bytes(l, &gate_bytes, &down_bytes);
+        if (ok) {
+            const ds4_gpu_stream_expert_table table =
+                graph_stream_expert_table_make(m, l, 0, gate_bytes, down_bytes);
+            ok = ds4_gpu_qwen4_stream_route(&table, g->selected, T * DS4_N_EXPERT_USED, mm,
+                                            &n_expert) != 0;
+        }
+    }
+#endif
     if (mm) {
         if (ok) {
             ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
-                                                      DS4_N_EXPERT, g->cap_tokens) &&
+                                                      n_expert, g->cap_tokens) &&
                  qwen4_moe_profile_boundary(profile, &last, &elapsed[1]) &&
                  ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->mixed, g->moe_lists, g->moe_counts, m->map, m->size,
                                                  l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
-                                                 l->ffn_gate_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED,
+                                                 l->ffn_gate_exps->type, n_expert, T, DS4_N_EXPERT_USED,
                                                  DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP, g->cap_tokens) &&
                  qwen4_moe_profile_boundary(profile, &last, &elapsed[2]) &&
                  qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
@@ -58587,7 +58634,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
         }
         if (ok) {
             ok = ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->moe_lists, g->moe_counts, m->map, m->size,
-                                                  l->ffn_down_exps->abs_offset, l->ffn_down_exps->type, DS4_N_EXPERT, T,
+                                                  l->ffn_down_exps->abs_offset, l->ffn_down_exps->type, n_expert, T,
                                                   DS4_N_EXPERT_USED, DS4_N_EXPERT_USED, DS4_N_FF_EXP, DS4_N_EMBD,
                                                   g->cap_tokens) &&
                  qwen4_moe_profile_boundary(profile, &last, &elapsed[4]) &&
@@ -58646,13 +58693,13 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
 #endif
     if (ok) {
         ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
-                                          l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
+                                          l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, n_expert, T,
                                           DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
                                           shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
                                           shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
                                           shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0 &&
              ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
-                                           l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
+                                           l->ffn_down_exps->type, n_expert, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
                                            DS4_N_EMBD, shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
                                            shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0;
     }
@@ -71257,6 +71304,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+        g_qwen4_cuda_streaming = e->ssd_streaming && e->backend == DS4_BACKEND_CUDA &&
+                                 ds4_model_is_qwen4();
         if (!ds4_engine_configure_streaming_auto_cache(e, opt->context_size)) {
             ds4_engine_close(e);
             *out = NULL;
@@ -71434,7 +71483,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                       weights_have_output_head(&e->weights)));
             ds4_model_map_span_vec spans;
             bool spans_ok = false;
-            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || g_qwen4_cuda_streaming) {
+                /* Every non-routed weight goes to VRAM before the expert
+                 * cache sizes itself from whatever is left. */
                 spans_ok = weights_model_map_decode_static_spans(&e->weights, true, true, &spans);
             } else if (load_slice) {
                 if (e->ssd_streaming_static_decode_map) {
@@ -71506,6 +71557,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                                         load_sizes,
                                                         load_span_count,
                                                         spans.max_tensor_bytes);
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(__APPLE__)
+            if (model_map_ok && g_qwen4_cuda_streaming) {
+                model_map_ok = ds4_gpu_preload_model_spans(e->model.map, e->model.size,
+                                                           load_offsets, load_sizes,
+                                                           load_span_count);
+            }
+            if (model_map_ok && g_qwen4_cuda_streaming) {
+                model_map_ok = qwen4_ram_expert_tier_init(&e->model, &e->weights, opt);
+            }
+#endif
             free(spans.v);
         } else if (load_slice) {
             const bool map_output =

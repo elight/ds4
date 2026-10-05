@@ -22,6 +22,8 @@
 #include "ds4_linux_memory.h"
 #include <unordered_map>
 #include <vector>
+#include <thread>
+#include <sys/mman.h>
 #include <algorithm>
 
 #include "cuda/mmq/ds4_mmq.h"
@@ -27137,6 +27139,215 @@ struct cuda_stream_upload_batch {
     ~cuda_stream_upload_batch() { (void)finish(); }
 };
 
+/* Pinned host-RAM tier between the VRAM slot cache and the SSD. Whole routed
+ * layers are read once at startup with large O_DIRECT reads into one
+ * THP-backed arena registered with CUDA, so a VRAM miss on a resident layer
+ * is a single DMA from RAM instead of a pread through the staging ring. */
+struct cuda_ram_tier_layer {
+    uint64_t up_offset, down_offset, gate_expert_bytes, down_expert_bytes;
+    uint32_t n_expert;
+    const char *gate, *up, *down;
+};
+static struct {
+    char *base = NULL;
+    uint64_t bytes = 0;
+    bool registered = false;
+    std::unordered_map<uint64_t, cuda_ram_tier_layer> by_gate;
+} g_ram_tier;
+static cudaStream_t g_ram_tier_stream = NULL;
+
+static struct {
+    uint64_t vram_hits, ram_hits, ssd_reads, ram_bytes, ssd_bytes;
+    uint64_t passes, first_gate, report_every;
+    double ram_sec, ssd_sec;
+    bool exit_hook;
+} g_stream_stats;
+
+static void cuda_stream_stats_print(const char *why) {
+    const auto &s = g_stream_stats;
+    const uint64_t total = s.vram_hits + s.ram_hits + s.ssd_reads;
+    if (!total) return;
+    fprintf(stderr,
+            "ds4: expert tiers (%s): %llu passes, %llu lookups: VRAM %.1f%%, RAM %.1f%% "
+            "(%.2f GiB, %.2f GB/s), SSD %.1f%% (%.2f GiB, %.2f GB/s)\n",
+            why, (unsigned long long)s.passes, (unsigned long long)total,
+            100.0 * (double)s.vram_hits / (double)total,
+            100.0 * (double)s.ram_hits / (double)total,
+            (double)s.ram_bytes / 1073741824.0,
+            s.ram_sec > 0 ? (double)s.ram_bytes / s.ram_sec / 1e9 : 0.0,
+            100.0 * (double)s.ssd_reads / (double)total,
+            (double)s.ssd_bytes / 1073741824.0,
+            s.ssd_sec > 0 ? (double)s.ssd_bytes / s.ssd_sec / 1e9 : 0.0);
+}
+
+static void cuda_stream_stats_at_exit(void) { cuda_stream_stats_print("exit"); }
+
+extern "C" void ds4_gpu_stream_stats_print(const char *why) { cuda_stream_stats_print(why); }
+
+static void cuda_stream_stats_note_pass(uint64_t gate_offset) {
+    auto &s = g_stream_stats;
+    if (!s.exit_hook) {
+        s.exit_hook = true;
+        const char *env = getenv("DS4_STREAM_STATS");
+        s.report_every = env && env[0] ? strtoull(env, NULL, 10) : 0;
+        atexit(cuda_stream_stats_at_exit);
+    }
+    if (!s.first_gate) s.first_gate = gate_offset;
+    if (gate_offset != s.first_gate) return;
+    s.passes++;
+    if (s.report_every && s.passes % s.report_every == 0) cuda_stream_stats_print("running");
+}
+
+static uint64_t cuda_linux_mem_available(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    unsigned long long kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+    }
+    fclose(f);
+    return (uint64_t)kb << 10;
+}
+
+struct cuda_ram_tier_read {
+    char *dst;
+    uint64_t offset, bytes;
+};
+
+extern "C" int ds4_gpu_ram_expert_tier_init(const ds4_gpu_stream_expert_table *layers,
+                                            uint32_t n_layers, uint64_t budget) {
+    if (g_ram_tier.base || !layers || !n_layers || budget == 0) return 1;
+    if (g_model_fd < 0) return 0;
+    const uint64_t page = 4096;
+    auto block = [&](uint64_t offset, uint64_t bytes) {
+        return (offset % page + bytes + page - 1) / page * page;
+    };
+    auto layer_bytes = [&](const ds4_gpu_stream_expert_table &t) {
+        const uint64_t g = (uint64_t)t.n_total_expert * t.gate_expert_bytes;
+        const uint64_t d = (uint64_t)t.n_total_expert * t.down_expert_bytes;
+        return block(t.gate_offset, g) + block(t.up_offset, g) + block(t.down_offset, d);
+    };
+    uint64_t all = 0;
+    for (uint32_t i = 0; i < n_layers; i++) all += layer_bytes(layers[i]);
+    const uint64_t headroom = UINT64_C(6) << 30;
+    const uint64_t avail = cuda_linux_mem_available();
+    const uint64_t room = avail > headroom ? avail - headroom : 0;
+    if (budget == UINT64_MAX) budget = room;
+    else if (budget > room) {
+        fprintf(stderr, "ds4: RAM expert tier: %.2f GiB requested, %.2f GiB fits under "
+                "MemAvailable minus 6 GiB; using that\n",
+                (double)budget / 1073741824.0, (double)room / 1073741824.0);
+        budget = room;
+    }
+    uint32_t n_fit = 0;
+    uint64_t bytes = 0;
+    while (n_fit < n_layers && bytes + layer_bytes(layers[n_fit]) <= budget)
+        bytes += layer_bytes(layers[n_fit++]);
+    if (!n_fit) {
+        fprintf(stderr, "ds4: RAM expert tier off: %.2f GiB budget holds no whole layer\n",
+                (double)budget / 1073741824.0);
+        return 1;
+    }
+    const double t0 = cuda_wall_sec();
+    void *base = mmap(NULL, (size_t)bytes, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    const bool hugetlb = base != MAP_FAILED;
+    if (!hugetlb) {
+        base = mmap(NULL, (size_t)bytes, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED) {
+            fprintf(stderr, "ds4: RAM expert tier mmap of %.2f GiB failed: %s\n",
+                    (double)bytes / 1073741824.0, strerror(errno));
+            return 1;
+        }
+        (void)madvise(base, (size_t)bytes, MADV_HUGEPAGE);
+    }
+    std::vector<cuda_ram_tier_read> reads;
+    char *cursor = (char *)base;
+    for (uint32_t i = 0; i < n_fit; i++) {
+        const auto &t = layers[i];
+        const uint64_t g = (uint64_t)t.n_total_expert * t.gate_expert_bytes;
+        const uint64_t d = (uint64_t)t.n_total_expert * t.down_expert_bytes;
+        const char *ptr[3];
+        const uint64_t offs[3] = {t.gate_offset, t.up_offset, t.down_offset};
+        const uint64_t lens[3] = {g, g, d};
+        for (int k = 0; k < 3; k++) {
+            const uint64_t aligned = offs[k] / page * page, len = block(offs[k], lens[k]);
+            /* 64 MiB pieces keep every reader thread busy to the end. */
+            for (uint64_t at = 0; at < len; at += UINT64_C(64) << 20)
+                reads.push_back({cursor + at, aligned + at,
+                                 std::min(len - at, UINT64_C(64) << 20)});
+            ptr[k] = cursor + (offs[k] - aligned);
+            cursor += len;
+        }
+        g_ram_tier.by_gate[t.gate_offset] = {t.up_offset, t.down_offset, t.gate_expert_bytes,
+                                             t.down_expert_bytes, t.n_total_expert,
+                                             ptr[0], ptr[1], ptr[2]};
+    }
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", g_model_fd);
+    int fd = open(path, O_RDONLY | O_DIRECT);
+    const bool direct = fd >= 0;
+    if (!direct) fd = g_model_fd;
+    std::atomic<size_t> next{0};
+    std::atomic<bool> failed{false};
+    struct stat st;
+    const uint64_t file_size = fstat(g_model_fd, &st) == 0 ? (uint64_t)st.st_size : UINT64_MAX;
+    auto reader = [&]() {
+        for (size_t j; !failed.load() && (j = next.fetch_add(1)) < reads.size();) {
+            const auto &r = reads[j];
+            uint64_t done = 0;
+            while (done < r.bytes) {
+                const ssize_t n = pread(fd, r.dst + done, (size_t)(r.bytes - done),
+                                        (off_t)(r.offset + done));
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) break; /* EOF inside the alignment tail is fine */
+                done += (uint64_t)n;
+            }
+            if (done < r.bytes && r.offset + done < file_size) failed = true;
+        }
+    };
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 8; i++) threads.emplace_back(reader);
+    for (auto &th : threads) th.join();
+    if (direct) close(fd);
+    const double t_read = cuda_wall_sec() - t0;
+    if (failed) {
+        fprintf(stderr, "ds4: RAM expert tier read failed: %s\n", strerror(errno));
+        g_ram_tier.by_gate.clear();
+        munmap(base, (size_t)bytes);
+        return 1;
+    }
+    g_ram_tier.base = (char *)base;
+    g_ram_tier.bytes = bytes;
+    g_ram_tier.registered = cudaHostRegister(base, (size_t)bytes, cudaHostRegisterPortable) == cudaSuccess;
+    if (!g_ram_tier.registered) (void)cudaGetLastError();
+    fprintf(stderr,
+            "ds4: RAM expert tier: %u/%u routed layers, %.2f GiB of %.2f GiB, read in %.1f s "
+            "(%.2f GB/s%s), %s, %s\n",
+            n_fit, n_layers, (double)bytes / 1073741824.0, (double)all / 1073741824.0,
+            t_read, (double)bytes / t_read / 1e9, direct ? " O_DIRECT" : "",
+            hugetlb ? "hugetlbfs" : "THP",
+            g_ram_tier.registered ? "pinned" : "NOT pinned (pageable copies)");
+    return 1;
+}
+
+static bool cuda_ram_tier_lookup(const ds4_gpu_stream_expert_table *table, uint64_t expert,
+                                 const char **gate, const char **up, const char **down) {
+    if (g_ram_tier.by_gate.empty()) return false;
+    const auto found = g_ram_tier.by_gate.find(table->gate_offset);
+    if (found == g_ram_tier.by_gate.end()) return false;
+    const auto &l = found->second;
+    if (l.up_offset != table->up_offset || l.down_offset != table->down_offset ||
+        l.gate_expert_bytes != table->gate_expert_bytes ||
+        l.down_expert_bytes != table->down_expert_bytes || expert >= l.n_expert) return false;
+    *gate = l.gate + expert * l.gate_expert_bytes;
+    *up = l.up + expert * l.gate_expert_bytes;
+    *down = l.down + expert * l.down_expert_bytes;
+    return true;
+}
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
@@ -27180,6 +27391,8 @@ static int cuda_stream_selected_cache_begin_load(
             const uint64_t expert_bytes = 2u * table->gate_expert_bytes + table->down_expert_bytes;
             uint64_t capacity = ds4_gpu_stream_expert_cache_budget_for_expert_size(
                 table->gate_expert_bytes, table->down_expert_bytes);
+            /* No budget: take what the card has left after the fixed weights. */
+            if (!capacity) capacity = UINT64_MAX;
             if (capacity < unique.size()) capacity = unique.size();
             size_t free_bytes = 0, total_bytes = 0;
             if (!cuda_ok(cudaMemGetInfo(&free_bytes, &total_bytes), "stream expert memory budget"))
@@ -27189,7 +27402,13 @@ static int cuda_stream_selected_cache_begin_load(
             if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, g_gpu[0].device_id) == cudaSuccess &&
                 integrated && ds4_linux_nonmovable_memory(&host_available))
                 free_bytes = (size_t)std::min(host_available, (uint64_t)total_bytes);
-            const uint64_t reserve = UINT64_C(8) << 30;
+            /* Headroom for allocator slack and late scratch, plus room to stage
+             * one whole layer contiguously for prefill. */
+            uint64_t reserve = UINT64_C(1536) << 20;
+            const char *reserve_env = getenv("DS4_CUDA_STREAM_VRAM_RESERVE_MB");
+            if (reserve_env && reserve_env[0])
+                reserve = (uint64_t)strtoull(reserve_env, NULL, 10) << 20;
+            reserve += (uint64_t)table->n_total_expert * expert_bytes;
             const uint64_t available = free_bytes > reserve ? free_bytes - reserve : 0;
             capacity = std::min(capacity, available / expert_bytes);
             if (capacity < unique.size()) {
@@ -27243,8 +27462,12 @@ static int cuda_stream_selected_cache_begin_load(
             }
             slots[i] = (int32_t)found->second;
             slot.used = stamp;
+            g_stream_stats.vram_hits++;
         }
+        cuda_stream_stats_note_pass(table->gate_offset);
         cuda_stream_upload_batch uploads;
+        uint64_t ram_bytes = 0, ssd_bytes = 0;
+        double ram_t0 = 0, ssd_sec = 0;
         for (size_t i = 0; i < unique.size(); i++) {
             if (slots[i] >= 0) continue;
             uint32_t victim = UINT32_MAX;
@@ -27265,6 +27488,27 @@ static int cuda_stream_selected_cache_begin_load(
             const uint64_t gate = table->gate_offset + expert * table->gate_expert_bytes;
             const uint64_t up = table->up_offset + expert * table->gate_expert_bytes;
             const uint64_t down = table->down_offset + expert * table->down_expert_bytes;
+            const char *ram_gate, *ram_up, *ram_down;
+            if (cuda_ram_tier_lookup(table, expert, &ram_gate, &ram_up, &ram_down)) {
+                if (!g_ram_tier_stream && !cuda_ok(cudaStreamCreateWithFlags(
+                        &g_ram_tier_stream, cudaStreamNonBlocking), "RAM tier stream"))
+                    return 0;
+                if (!ram_bytes) ram_t0 = cuda_wall_sec();
+                if (!cuda_ok(cudaMemcpyAsync(cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
+                        ram_gate, table->gate_expert_bytes, cudaMemcpyHostToDevice, g_ram_tier_stream), "RAM gate") ||
+                    !cuda_ok(cudaMemcpyAsync(cache.up_ptr + (uint64_t)victim * table->gate_expert_bytes,
+                        ram_up, table->gate_expert_bytes, cudaMemcpyHostToDevice, g_ram_tier_stream), "RAM up") ||
+                    !cuda_ok(cudaMemcpyAsync(cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
+                        ram_down, table->down_expert_bytes, cudaMemcpyHostToDevice, g_ram_tier_stream), "RAM down"))
+                    return 0;
+                ram_bytes += 2u * table->gate_expert_bytes + table->down_expert_bytes;
+                g_stream_stats.ram_hits++;
+                slot = {gate, up, down, stamp};
+                g_stream_expert_by_gate[gate] = victim;
+                slots[i] = (int32_t)victim;
+                continue;
+            }
+            const double ssd_t0 = cuda_wall_sec();
             uploads.active = true;
             if (!cuda_model_copy_to_device_streamed(
                     cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
@@ -27276,11 +27520,28 @@ static int cuda_stream_selected_cache_begin_load(
                     cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
                     table->model_map, table->model_size, down, table->down_expert_bytes, "stream down", uploads.chunks))
                 return 0;
+            ssd_sec += cuda_wall_sec() - ssd_t0;
+            ssd_bytes += 2u * table->gate_expert_bytes + table->down_expert_bytes;
+            g_stream_stats.ssd_reads++;
             slot = {gate, up, down, stamp};
             g_stream_expert_by_gate[gate] = victim;
             slots[i] = (int32_t)victim;
         }
+        if (ram_bytes) {
+            if (!cuda_ok(cudaStreamSynchronize(g_ram_tier_stream), "RAM tier upload")) {
+                g_stream_expert_by_gate.clear();
+                for (auto &slot : g_stream_expert_slots) slot.used = 0;
+                return 0;
+            }
+            g_stream_stats.ram_bytes += ram_bytes;
+            g_stream_stats.ram_sec += cuda_wall_sec() - ram_t0;
+        }
+        const double finish_t0 = cuda_wall_sec();
         if (!uploads.finish()) return 0;
+        if (ssd_bytes) {
+            g_stream_stats.ssd_bytes += ssd_bytes;
+            g_stream_stats.ssd_sec += ssd_sec + (cuda_wall_sec() - finish_t0);
+        }
         g_stream_prefill_ids = remap;
         g_stream_prefill_slots = slots;
         for (auto &id : remap) id = slots[id];
@@ -33257,6 +33518,25 @@ extern "C" int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model
     return 1;
 }
 
+extern "C" int ds4_gpu_preload_model_spans(const void *model_map, uint64_t model_size,
+        const uint64_t *offsets, const uint64_t *sizes, uint32_t count) {
+    if (!model_map || !offsets || !sizes) return 0;
+    const double t0 = cuda_wall_sec();
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (offsets[i] > model_size || sizes[i] > model_size - offsets[i] ||
+            !cuda_model_range_ptr(model_map, offsets[i], sizes[i], "static weights")) {
+            fprintf(stderr, "ds4: CUDA could not preload static span %u (%.2f MiB)\n",
+                    i, (double)sizes[i] / 1048576.0);
+            return 0;
+        }
+        total += sizes[i];
+    }
+    fprintf(stderr, "ds4: CUDA preloaded %.2f GiB of non-routed weights in %.1f s\n",
+            (double)total / 1073741824.0, cuda_wall_sec() - t0);
+    return 1;
+}
+
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
         ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
         const void *model_map, uint64_t model_size,
@@ -34036,4 +34316,69 @@ extern "C" int ds4_gpu_tp_big_gate_wait(uint64_t seq) {
 #include "ds4_glm53_vision_gpu.cuh"
 #include "ds4_deepseek4_vision_gpu.cuh"
 #include "ds4_deepseek41_cuda.cuh"
+
+/* Qwen's MoE launchers take expert tensors by file offset. While streaming,
+ * the routed layer's offsets point here instead: the slot arenas for decode,
+ * or one layer's experts staged contiguously for the tiled prefill GEMMs. */
+static struct {
+    int valid;
+    uint64_t gate_offset, up_offset, down_offset;
+    const char *gate, *up, *down;
+} g_qwen4_stream_redirect;
+
+extern "C" int ds4_gpu_qwen4_stream_route(const ds4_gpu_stream_expert_table *table,
+        ds4_gpu_tensor *selected, uint32_t n_selected, int compact, uint32_t *n_expert_out) {
+    g_qwen4_stream_redirect.valid = 0;
+    if (!g_ssd_streaming_mode) return 1;
+    if (!table || !selected || !n_selected || !n_expert_out ||
+        selected->bytes < (uint64_t)n_selected * sizeof(int32_t)) return 0;
+    std::vector<int32_t> ids;
+    try { ids.resize(n_selected); } catch (...) { return 0; }
+    if (!cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "Qwen route wait") ||
+        !cuda_ok(cudaMemcpy(ids.data(), selected->ptr, (size_t)n_selected * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost), "Qwen streaming selected-id read") ||
+        !cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected)) return 0;
+    auto &cache = g_stream_selected_cache;
+    auto &r = g_qwen4_stream_redirect;
+    r.gate_offset = table->gate_offset;
+    r.up_offset = table->up_offset;
+    r.down_offset = table->down_offset;
+    cudaStream_t s = cuda_decode_stream();
+    if (!compact) {
+        if (!cuda_ok(cudaMemcpyAsync(selected->ptr, cache.slot_selected_ptr,
+                (size_t)n_selected * sizeof(int32_t), cudaMemcpyDeviceToDevice, s),
+                "Qwen slot remap")) return 0;
+        r.gate = cache.gate_ptr; r.up = cache.up_ptr; r.down = cache.down_ptr;
+        *n_expert_out = cache.compact_count;
+        r.valid = 1;
+        return 1;
+    }
+    const uint64_t count = g_stream_prefill_slots.size();
+    const uint64_t gb = cache.gate_expert_bytes, db = cache.down_expert_bytes;
+    if (!count || !cuda_stream_selected_ensure_bytes(&cache.prefill_ptr, &cache.prefill_capacity,
+            count * (2u * gb + db), "Qwen prefill experts")) return 0;
+    char *g = cache.prefill_ptr, *u = g + count * gb, *d = u + count * gb;
+    /* Runs of consecutive slots copy as one span. */
+    for (uint64_t i = 0; i < count;) {
+        const uint64_t slot = (uint32_t)g_stream_prefill_slots[i];
+        uint64_t n = 1;
+        while (i + n < count && (uint64_t)(uint32_t)g_stream_prefill_slots[i + n] == slot + n) n++;
+        if (!cuda_ok(cudaMemcpyAsync(g + i * gb, cache.gate_ptr + slot * gb, n * gb,
+                                     cudaMemcpyDeviceToDevice, s), "Qwen compact gate") ||
+            !cuda_ok(cudaMemcpyAsync(u + i * gb, cache.up_ptr + slot * gb, n * gb,
+                                     cudaMemcpyDeviceToDevice, s), "Qwen compact up") ||
+            !cuda_ok(cudaMemcpyAsync(d + i * db, cache.down_ptr + slot * db, n * db,
+                                     cudaMemcpyDeviceToDevice, s), "Qwen compact down")) return 0;
+        i += n;
+    }
+    /* Pageable source: the copy is staged before this call returns. */
+    if (!cuda_ok(cudaMemcpyAsync(selected->ptr, g_stream_prefill_ids.data(),
+            (size_t)n_selected * sizeof(int32_t), cudaMemcpyHostToDevice, s),
+            "Qwen compact IDs")) return 0;
+    r.gate = g; r.up = u; r.down = d;
+    *n_expert_out = (uint32_t)count;
+    r.valid = 1;
+    return 1;
+}
+
 #include "ds4_qwen4_cuda.cuh"

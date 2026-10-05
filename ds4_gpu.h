@@ -386,6 +386,32 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,
         uint32_t                           n_selected);
+/* CUDA only. Copies the given model spans into VRAM now, so a streaming
+ * expert cache sized afterwards does not take the room they need. */
+int ds4_gpu_preload_model_spans(
+        const void     *model_map,
+        uint64_t        model_size,
+        const uint64_t *offsets,
+        const uint64_t *sizes,
+        uint32_t        count);
+/* Read routed experts into a pinned host-RAM tier under the streaming VRAM
+ * cache. budget UINT64_MAX means MemAvailable minus 6 GiB; whole layers are
+ * taken in table order. Returns 0 only on a hard error. */
+int ds4_gpu_ram_expert_tier_init(const ds4_gpu_stream_expert_table *layers,
+                                 uint32_t n_layers, uint64_t budget);
+/* VRAM/RAM/SSD expert hit counters. DS4_STREAM_STATS=N also prints every N passes. */
+void ds4_gpu_stream_stats_print(const char *why);
+
+/* CUDA only. Loads one Qwen layer's routed experts into the streaming cache
+ * and rewrites selected in place: slot IDs for decode, or indices into one
+ * contiguous staged copy when compact. n_expert_out is the expert count the
+ * MoE kernels must use instead of the model's. */
+int ds4_gpu_qwen4_stream_route(
+        const ds4_gpu_stream_expert_table *table,
+        ds4_gpu_tensor                    *selected,
+        uint32_t                           n_selected,
+        int                                compact,
+        uint32_t                          *n_expert_out);
 #ifdef __APPLE__
 /* The async selected-load worker registers itself so Metal cache paths never
  * wait on command buffers from that thread (they fail the load instead and

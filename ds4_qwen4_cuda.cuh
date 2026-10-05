@@ -372,6 +372,23 @@ static const char *weight(const void *map, uint64_t size, uint64_t off, uint64_t
     return cuda_resolve_weight_ptr(map, off, bytes, 0, "Qwen weights");
 }
 
+/* Routed expert tensors. While streaming, never fall back to mapping a whole
+ * layer's experts: that would pull 0.7 GiB into VRAM behind the cache's back. */
+static const char *expert_weight(const void *map, uint64_t size, uint64_t off, uint64_t bytes) {
+    const auto &r = g_qwen4_stream_redirect;
+    if (r.valid) {
+        if (off == r.gate_offset) return r.gate;
+        if (off == r.up_offset) return r.up;
+        if (off == r.down_offset) return r.down;
+    }
+    if (g_ssd_streaming_mode) {
+        fprintf(stderr, "ds4: Qwen streaming expert offset %llu was not routed\n",
+                (unsigned long long)off);
+        return NULL;
+    }
+    return weight(map, size, off, bytes);
+}
+
 static int launched(void) { return cuda_ok(cudaGetLastError(), "Qwen kernel"); }
 
 __device__ __forceinline__ float sum(float x) {
@@ -2092,7 +2109,7 @@ extern "C" int ds4_gpu_qwen4_moe_mid_tensor(ds4_gpu_tensor *mid, const ds4_gpu_t
     if (!T || !NE || !NS || !K || !M || !tensor(mid, (uint64_t)T*NO*M*4) ||
         !tensor(x, (uint64_t)T*K*4) || !tensor(sel, (uint64_t)T*NS*4)) return 0;
     const uint64_t bytes = expert_row_bytes(type, K)*M*NE, sb = row_bytes(st, K)*M;
-    const char *g = weight(map,size,go,bytes), *u = weight(map,size,uo,bytes);
+    const char *g = expert_weight(map,size,go,bytes), *u = expert_weight(map,size,uo,bytes);
     const char *sg = st != UINT_MAX ? weight(map,size,sgo,sb) : NULL;
     const char *su = st != UINT_MAX ? weight(map,size,suo,sb) : NULL;
     if (!g || !u || (st != UINT_MAX && (!sg || !su))) return 0;
@@ -2108,7 +2125,7 @@ extern "C" int ds4_gpu_qwen4_moe_down_tensor(ds4_gpu_tensor *part, const ds4_gpu
     const unsigned NO = NS + (st != UINT_MAX);
     if (!T || !NE || !NS || !K || !M || !tensor(part,(uint64_t)T*NO*M*4) ||
         !tensor(mid,(uint64_t)T*NO*K*4) || !tensor(sel,(uint64_t)T*NS*4)) return 0;
-    const char *w = weight(map,size,off,expert_row_bytes(type,K)*M*NE);
+    const char *w = expert_weight(map,size,off,expert_row_bytes(type,K)*M*NE);
     const char *sw = st != UINT_MAX ? weight(map,size,so,row_bytes(st,K)*M) : NULL;
     if (!w || (st != UINT_MAX && !sw)) return 0;
     return moe_mv_dispatch((float *)part->ptr,(const float *)mid->ptr,(const int *)sel->ptr,
@@ -2150,7 +2167,7 @@ static int qwen4_moe_mm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         !tensor(out,(uint64_t)T*NO*M*4) || !tensor(x,(uint64_t)T*(down ? NO : 1)*K*4) ||
         !tensor(lists,(uint64_t)NE*cap*4) || !tensor(counts,(uint64_t)NE*4)) return 0;
     const uint64_t bytes = expert_row_bytes(type,K)*M*NE;
-    const char *w0 = weight(map,size,o0,bytes), *w1 = down ? NULL : weight(map,size,o1,bytes);
+    const char *w0 = expert_weight(map,size,o0,bytes), *w1 = down ? NULL : expert_weight(map,size,o1,bytes);
     if (!w0 || (!down && !w1)) return 0;
     return matrix_dispatch((float *)out->ptr,(const float *)x->ptr,w0,w1,(const int *)lists->ptr,
         (const int *)counts->ptr,type,NE,T,NS,NO,K,M,cap,down);
