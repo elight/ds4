@@ -743,8 +743,9 @@ typedef struct {
     uint64_t *ram_used;
 
     uint64_t tick;
-    int *ram_pending;               /* parts still being read, guarded by the io mutex */
-    uint64_t hit_vram, hit_ram, miss_ssd, ssd_bytes, pf_reads, pf_hits;
+    int *ram_pending;
+    char *ram_pf;                   /* filled by lookahead, not used yet */               /* parts still being read, guarded by the io mutex */
+    uint64_t hit_vram, hit_ram, miss_ssd, ssd_bytes, pf_reads, pf_hits, pf_used;
     double t_ssd, t_wait;
     uint32_t count[M2_NEXP];        /* routing profile */
 } m2_tiers;
@@ -761,6 +762,7 @@ typedef struct {
     m2_iopool io;
     /* device activations */
     float *rlog_ahead, *h_rlog_ahead;
+    int all_logits;     /* --score: logits for every token of a batch */
     int lookahead;
     float *x, *xn, *qkv, *att, *tmp, *gt, *u, *h, *y, *rlog, *logits, *wts;
     int *assign;
@@ -896,7 +898,7 @@ static void alloc_runtime(m2_model *M) {
     DALLOC(M->y, (size_t)U * M2_TOPK * M2_EMBD);
     DALLOC(M->rlog, (size_t)U * M2_NE);
     DALLOC(M->rlog_ahead, (size_t)M2_NL * M2_NE);
-    DALLOC(M->logits, (size_t)M->vb.n_vocab);
+    DALLOC(M->logits, (size_t)M->vb.n_vocab * (M->all_logits ? U : 1));
     DALLOC(M->wts, (size_t)U * M2_TOPK);
     DALLOC(M->assign, (size_t)U * M2_TOPK);
     DALLOC(M->jobs, M2_NE);
@@ -904,7 +906,7 @@ static void alloc_runtime(m2_model *M) {
     M->h_x = m2g_host_alloc((size_t)U * M2_EMBD * sizeof(float));
     M->h_rlog = m2g_host_alloc((size_t)U * M2_NE * sizeof(float));
     M->h_rlog_ahead = m2g_host_alloc((size_t)M2_NL * M2_NE * sizeof(float));
-    M->h_logits = m2g_host_alloc((size_t)M->vb.n_vocab * sizeof(float));
+    M->h_logits = m2g_host_alloc((size_t)M->vb.n_vocab * (M->all_logits ? U : 1) * sizeof(float));
     M->h_wts = m2g_host_alloc((size_t)U * M2_TOPK * sizeof(float));
     M->h_assign = m2g_host_alloc((size_t)U * M2_TOPK * sizeof(int));
     M->h_jobs = m2g_host_alloc(M2_NE * sizeof(m2_moe_job));
@@ -943,9 +945,10 @@ static void tiers_init(m2_model *M, double vram_reserve_gb, int max_slots, doubl
     T->ram_owner = xmalloc((size_t)nr * sizeof(int));
     T->ram_used = xcalloc((size_t)nr, sizeof(uint64_t));
     T->ram_pending = xcalloc((size_t)nr, sizeof(int));
+    T->ram_pf = xcalloc((size_t)nr, 1);
     for (int i = 0; i < nr; i++) T->ram_owner[i] = -1;
-    fprintf(stderr, "ds4-mimo2: tiers: %d VRAM slots (%.1f GB), %d RAM entries (%.1f GB pinned in %.1fs), %d experts total\n",
-            n, n * (double)M2_EXP_BYTES / 1e9, nr, nr * (double)T->ram_stride / 1e9, now_s() - t0, M2_NEXP);
+    fprintf(stderr, "ds4-mimo2: tiers: %d VRAM slots (%.1f GB), %d RAM entries (%.1f GB pinned in %.1fs), %d routed experts\n",
+            n, n * (double)M2_EXP_BYTES / 1e9, nr, nr * (double)T->ram_stride / 1e9, now_s() - t0, M2_NEXP - M2_NE);
 }
 
 /* Least recently used entry not touched in the current tick. */
@@ -1001,6 +1004,7 @@ static int ram_claim(m2_model *M, int id) {
     T->ram_owner[r] = id;
     T->ram_of[id] = r;
     T->ram_used[r] = T->tick;
+    T->ram_pf[r] = 0;
     return r;
 }
 
@@ -1036,6 +1040,7 @@ static void tiers_fetch(m2_model *M, const int *need, int n, int *slot_out) {
         const int id = need[miss[k]];
         const int r = T->ram_of[id];
         if (r >= 0) {   /* resident, or still arriving from a lookahead read */
+            if (T->ram_pf[r]) { T->pf_used++; T->ram_pf[r] = 0; }
             if (io_peek_ctr(&M->io, &T->ram_pending[r]) > 0) { from_ssd[k] = 1; T->pf_hits++; }
             continue;
         }
@@ -1129,7 +1134,9 @@ static void prefetch_ahead(m2_model *M, int l) {
         for (int k = 0; k < M2_TOPK; k++) {
             const int id = (l + d) * M2_NE + ids[k];
             if (T->slot_of[id] >= 0 || T->ram_of[id] >= 0) continue;
-            ram_fill(M, ram_claim(M, id), id, false);
+            const int r = ram_claim(M, id);
+            ram_fill(M, r, id, false);
+            T->ram_pf[r] = 1;
             T->pf_reads++;
         }
     }
@@ -1202,10 +1209,11 @@ static void forward(m2_model *M, const int *tok, int n, int pos0, bool want_logi
         }
     }
     if (want_logits) {
-        const float *last = M->x + (size_t)(n - 1) * M2_EMBD;
-        GCK(m2g_rmsnorm(last, M->out_norm, M->xn, M2_EMBD, 1, M2_EPS));
-        GCK(m2g_matmul(M2_T_Q6_K, M->output, M->vb.n_vocab, M2_EMBD, M->xn, M2_EMBD, M->logits, M->vb.n_vocab, 1, 0));
-        GCK(m2g_download(M->h_logits, M->logits, (size_t)M->vb.n_vocab * sizeof(float)));
+        const int nl = M->all_logits ? n : 1;
+        const float *rows = M->x + (size_t)(n - nl) * M2_EMBD;
+        GCK(m2g_rmsnorm(rows, M->out_norm, M->xn, M2_EMBD, nl, M2_EPS));
+        GCK(m2g_matmul(M2_T_Q6_K, M->output, M->vb.n_vocab, M2_EMBD, M->xn, M2_EMBD, M->logits, M->vb.n_vocab, nl, 0));
+        GCK(m2g_download(M->h_logits, M->logits, (size_t)nl * M->vb.n_vocab * sizeof(float)));
     } else {
         GCK(m2g_sync());
     }
@@ -1297,8 +1305,10 @@ static void usage(void) {
         "  --bench N          prefill N synthetic tokens, then decode -n tokens; print t/s\n"
         "  --tokens           print token ids of the prompt and exit\n"
         "  --top-logits K     print the top K logits after the prompt\n"
+        "  --score            teacher-force the prompt: perplexity and top-1 agreement\n"
+        "  --score-from N     score only tokens from position N on\n"
         "  --io-threads N     SSD reader threads (default 8)\n"
-        "  --lookahead N      decode: prefetch predicted experts N layers ahead (default 2, 0 off)\n"
+        "  --lookahead N      decode: prefetch predicted experts N layers ahead (default 0, off)\n"
         "  -v                 verbose\n");
     exit(2);
 }
@@ -1329,14 +1339,15 @@ static void print_stats(const m2_model *M, const char *what, const m2_tiers *bef
             what, (unsigned long long)tot, tot ? 100.0 * hv / tot : 0, tot ? 100.0 * hr / tot : 0,
             tot ? 100.0 * ms / tot : 0, (T->ssd_bytes - before->ssd_bytes) / 1e9);
     if (T->pf_reads > before->pf_reads)
-        fprintf(stderr, "ds4-mimo2: %s lookahead: %llu reads issued, %llu caught still in flight\n", what,
-                (unsigned long long)(T->pf_reads - before->pf_reads), (unsigned long long)(T->pf_hits - before->pf_hits));
+        fprintf(stderr, "ds4-mimo2: %s lookahead: %llu reads issued, %llu used (%llu still in flight)\n", what,
+                (unsigned long long)(T->pf_reads - before->pf_reads), (unsigned long long)(T->pf_used - before->pf_used),
+                (unsigned long long)(T->pf_hits - before->pf_hits));
 }
 
 int main(int argc, char **argv) {
     const char *model = NULL, *prompt = NULL, *pfile = NULL, *prof = NULL, *prof_out = NULL;
     int n_gen = 128, ctx = 8192, ubatch = 1024, raw = 0, think = 0, slots = -1, seed = 1, bench = 0;
-    int show_tokens = 0, top_logits = 0, io_threads = 8, verbose = 0, lookahead = 2;
+    int show_tokens = 0, top_logits = 0, io_threads = 8, verbose = 0, lookahead = 0, score = 0, score_from = 0;
     double ram_gb = -1, reserve = 0.6;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -1358,6 +1369,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--bench")) bench = atoi(NEXT());
         else if (!strcmp(a, "--tokens")) show_tokens = 1;
         else if (!strcmp(a, "--top-logits")) top_logits = atoi(NEXT());
+        else if (!strcmp(a, "--score")) score = 1;
+        else if (!strcmp(a, "--score-from")) score_from = atoi(NEXT());
         else if (!strcmp(a, "--io-threads")) io_threads = atoi(NEXT());
         else if (!strcmp(a, "--lookahead")) lookahead = atoi(NEXT());
         else if (!strcmp(a, "-v")) verbose = 1;
@@ -1372,6 +1385,8 @@ int main(int argc, char **argv) {
     M.ubatch = ubatch;
     M.verbose = verbose;
     M.lookahead = lookahead;
+    M.all_logits = score;
+    if (score && ubatch > 64) M.ubatch = ubatch = 64;
     double t0 = now_s();
     model_load(&M, model, show_tokens);
 
@@ -1426,6 +1441,35 @@ int main(int argc, char **argv) {
     tiers_init(&M, reserve, slots, ram_gb);
     if (seed) profile_seed(&M, prof);
 
+    if (score) {   /* every next token of the prompt, scored */
+        double nll = 0;
+        int agree = 0, cnt = 0;
+        for (int i = 0; i < pt.n - 1; i += M.ubatch) {
+            const int nb = pt.n - 1 - i < M.ubatch ? pt.n - 1 - i : M.ubatch;
+            forward(&M, pt.v + i, nb, i, true);
+            for (int t = 0; t < nb; t++) {
+                const int pos = i + t, next = pt.v[pos + 1];
+                if (pos + 1 < score_from) continue;
+                const float *lg = M.h_logits + (size_t)t * M.vb.n_vocab;
+                const int am = argmax(lg, M.vb.n_vocab);
+                double z = 0;
+                for (int v = 0; v < M.vb.n_vocab; v++) z += exp((double)lg[v] - lg[am]);
+                const double lp = (double)lg[next] - lg[am] - log(z);
+                nll -= lp;
+                cnt++;
+                if (am == next) agree++;
+                else {
+                    char a[64], b[64];
+                    int la = detok(&M.vb, am, a, 63), lb = detok(&M.vb, next, b, 63);
+                    a[la] = 0; b[lb] = 0;
+                    printf("pos %4d: top '%s' (%.3f) vs text '%s' (%.3f)\n", pos + 1, a, lg[am], b, lg[next]);
+                }
+            }
+        }
+        printf("score: %d tokens, ppl %.4f, top-1 agreement %.1f%%\n", cnt, exp(nll / cnt), 100.0 * agree / cnt);
+        return 0;
+    }
+
     /* prefill */
     m2_tiers snap = M.tr;
     double tp = now_s();
@@ -1453,7 +1497,7 @@ int main(int argc, char **argv) {
     /* greedy decode */
     snap = M.tr;
     double td = now_s();
-    int pos = pt.n, ngen = 0;
+    int pos = pt.n, ngen = 0, nfwd = 0;
     int tok = argmax(M.h_logits, M.vb.n_vocab);
     for (; ngen < n_gen; ngen++) {
         if (!bench && (tok == M.vb.eos || tok == M.vb.im_end || tok == M.vb.eot)) break;
@@ -1465,11 +1509,12 @@ int main(int argc, char **argv) {
         }
         if (ngen + 1 == n_gen) { ngen++; break; }
         forward(&M, &tok, 1, pos++, true);
+        nfwd++;
         tok = argmax(M.h_logits, M.vb.n_vocab);
     }
     td = now_s() - td;
     if (!bench) printf("\n");
-    const int ndec = ngen > 1 ? ngen - 1 : 0;   /* forwards actually run */
+    const int ndec = nfwd;
     fprintf(stderr, "ds4-mimo2: decode %d tokens in %.2fs = %.2f t/s (SSD wait %.2fs)\n",
             ndec, td, ndec ? ndec / td : 0, M.tr.t_ssd - snap.t_ssd);
     print_stats(&M, "decode", &snap);
