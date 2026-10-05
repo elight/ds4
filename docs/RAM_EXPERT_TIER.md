@@ -71,6 +71,54 @@ Command: `ds4-bench -m Qwen3.8-Flash-Next-Q2.gguf --cuda --ssd-streaming
 --prompt-file tests/long_context_story_prompt.txt --ctx-start 8192 --ctx-max 8192
 --gen-tokens 128`, plus `--ram-expert-cache 0` for the phase 1 row.
 
+### Phase 4: CPU computes RAM misses (hybrid decode)
+
+Default on; `DS4_CPU_HYBRID=0` turns it off. Same command, the story prompt
+repeated twice so a 32K frontier fits (`misc/llmbox/qwen-hybrid.sh bench`).
+
+| ctx | Hybrid | Decode t/s | Prefill t/s | VRAM / PCIe / CPU share of lookups | Slots |
+|---:|---|---:|---:|---|---:|
+| 8192 | off | 21.53 | 727.2 | 44.2% / 55.8% / 0% | 5575 |
+| 8192 | **on** | **34.47** | 721.6 | 43.7% / 31.6% / 24.7% | 5575 |
+| 32768 | off | 28.04 | 705.9 | 32.1% / 67.9% / 0% | 4841 |
+| 32768 | **on** | **34.70** | 705.2 | 22.7% / 61.9% / 15.4% | 4841 |
+
+Decode is 60% faster at 8K and 24% faster at 32K; prefill is unchanged (it
+batches on the GPU). The lookup shares include prefill, which is why PCIe
+dominates them even when decode sends almost nothing over PCIe.
+
+Quality, teacher-forced over 480 story tokens (`qwen-hybrid.sh ppl`):
+
+| Mode | Perplexity |
+|---|---:|
+| hybrid off (all experts on the GPU) | 15.878 |
+| hybrid on, `DS4_CPU_HYBRID_EXACT=1` (float activations, scalar) | 15.890 |
+| hybrid on (8-bit activations, AVX2) | 15.535 |
+
+The exact mode matches the GPU to 0.08%, so the CPU kernels are right. The
+8-bit activation path moves perplexity by 2%, in the good direction on this
+text, which is within what quantising activations does either way.
+
+### Strata Q2_0 on the same box
+
+Strata's shipped `strata-q2_0.json` (MTP drafts, `--spec 4`), same story text,
+128 tokens, temperature 0 (`misc/llmbox/strata-bench.sh spec`). Strata will not
+serve a native pack without MTP, so its draft acceptance gives the rate per
+verify pass.
+
+| ctx | Engine | Decode t/s | Tokens per pass | Passes/s | Prefill t/s | Expert slots |
+|---:|---|---:|---:|---:|---:|---:|
+| 8192 | ds4 hybrid | 34.47 | 1 | 34.5 | 721.6 | 5575 |
+| 8192 | Strata | 107.9 | 2.78 | 38.8 | 2196.7 | 13398 |
+| 32768 | ds4 hybrid | 34.70 | 1 | 34.7 | 705.2 | 4841 |
+| 32768 | Strata | 102.5 | 2.98 | 34.4 | 2433.4 | 13398 |
+
+Per forward pass, ds4 matches Strata at 32K and is 11% behind at 8K. The
+3x decode gap is MTP drafting, and the 3x prefill gap is Strata's batched
+prompt path. Strata also holds 2.8 times as many experts in VRAM: it budgets
+the card with 32K of int8 KV resident, while ds4 reserves 7.7 GiB of prefill
+and context buffers.
+
 The 147 GB Qwen file is mostly a 95 GiB BF16 n-gram table that stays on disk;
 the routed experts are 35.4 GiB and the rest of the weights are 6.3 GiB in VRAM.
 Correctness: prompt logits from a 256-slot SSD-only cache and from the full
