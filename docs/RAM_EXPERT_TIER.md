@@ -65,6 +65,13 @@ VRAM hit rate, RAM hit rate, SSD bytes per token. Results go in the table below.
 |---|---|---|---:|---:|---:|---|
 | 2026-10-05 | Qwen3.8 Q2 | 1: VRAM slots + SSD | 6.57 | 315.30 | 46.3% | `--ram-expert-cache 0`; 62.8 GiB read from SSD at 2.0 GB/s |
 | 2026-10-05 | Qwen3.8 Q2 | 2: + pinned RAM tier | 29.34 | 717.35 | 59.2% | all 35.4 GiB of experts in RAM (16 s O_DIRECT fill); RAM→VRAM at 10.9 GB/s; no SSD reads |
+| 2026-10-05 | MiMo V2.6 Flash Q2_K | 6, inclusive tiers | 3.41 | — | 65.8% | story: 34-token prompt, 154 decoded, ctx 4096, 36 GB RAM tier |
+| 2026-10-05 | MiMo V2.6 Flash Q2_K | 6, exclusive tiers | 3.66 | — | 65.8% | same story run; SSD share 14.8% → 6.8%. 3.40 when other tenants leave 10 fewer slots |
+| 2026-10-05 | MiMo V2.6 Flash Q2_K | llama.cpp `-ot exps=CPU` | 4.08 | — | — | same story run, 10 threads, page cache |
+| 2026-10-05 | MiMo V2.6 Flash Q2_K | 6, ctx 8192, ubatch 1024 | 2.64 | 19.39 | 63.1% | 2204-token prompt (llama.cpp `docs/build.md`), 63 decoded |
+| 2026-10-05 | MiMo V2.6 Flash Q2_K | 6, ctx 8192, ubatch 2304 | 2.52 | 27.25 | 62.0% | one prefill pass reads 65 GB from SSD instead of 164 GB; costs 84 VRAM slots |
+| 2026-10-05 | MiMo V2.6 Flash Q2_K | 6, ctx 8192, 44 GB RAM | 2.87 | 20.66 | 63.1% | `--ram-gb 44`, ubatch 1024 |
+| 2026-10-05 | MiMo V2.6 Flash Q2_K | llama.cpp, ctx 8192 | 3.66 | 17.59 | — | same 2204-token prompt, `-b 1024 -ub 1024` |
 
 RTX 3090, PCIe gen3, ctx 8192, 128 generated tokens, 5575 VRAM slots (7.7 GiB).
 Command: `ds4-bench -m Qwen3.8-Flash-Next-Q2.gguf --cuda --ssd-streaming
@@ -75,3 +82,28 @@ The 147 GB Qwen file is mostly a 95 GiB BF16 n-gram table that stays on disk;
 the routed experts are 35.4 GiB and the rest of the weights are 6.3 GiB in VRAM.
 Correctness: prompt logits from a 256-slot SSD-only cache and from the full
 RAM tier are bit-identical.
+
+### MiMo V2.6 Flash (`ds4-mimo2`)
+
+A separate engine, `ds4_mimo2.c` + `ds4_mimo2_cuda.cu`, built with
+`make ds4-mimo2`. It loads the ggml-org split GGUF directly (pass the
+`-00001-of-` shard). Output matches llama.cpp: identical tokens on a short
+prompt, and 95.5% top-1 agreement teacher-forcing llama.cpp's own 154-token
+story (`--score`; every miss is a near-tie under 0.3 logits).
+
+How the tiers behave:
+
+- **Exclusive.** An expert lives in VRAM or in RAM, not both. Promoting one
+  frees its RAM entry; the VRAM expert it displaces is copied back down to RAM
+  on its own CUDA stream, overlapping the uploads.
+- **Prefill streams.** A batch of 256 or more tokens touches nearly every
+  expert, a scan larger than the cache. Those layers pass their misses through
+  transient slots instead of flushing the cache.
+- **Lookahead is off** (`--lookahead N` turns it on). Decode is bound by the
+  SSD, so speculative reads slow the reads that are actually needed: 3.41 t/s
+  off, 3.07 t/s at depth 2.
+
+Where decode time goes on the 2204-token run, ~380 ms/token: ~180 ms waiting
+on the SSD (16% of experts), ~65 ms copying RAM-tier experts over PCIe, the
+rest compute. The CPU-computes-RAM-experts split (branch `cpu-hybrid`) plugs in
+at `moe_cpu_split()`, which already receives each job's tier.

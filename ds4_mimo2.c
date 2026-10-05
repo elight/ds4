@@ -727,6 +727,7 @@ static void io_wait(m2_iopool *p) {
 /* ---- expert tiers -------------------------------------------------------- */
 
 #define M2_NEXP (M2_NL * M2_NE)
+#define M2_STREAM_MIN 256         /* batch size from which a layer streams its misses */
 
 typedef struct {
     int nslots;
@@ -734,6 +735,7 @@ typedef struct {
     int slot_of[M2_NEXP];
     int *slot_owner;
     uint64_t *slot_used;
+    uint8_t *slot_tmp;              /* holds a streamed expert: evict first, never demote */
 
     int nram;
     uint8_t *arena;                 /* pinned, nram * ram_stride */
@@ -745,7 +747,7 @@ typedef struct {
     uint64_t tick;
     int *ram_pending;
     char *ram_pf;                   /* filled by lookahead, not used yet */               /* parts still being read, guarded by the io mutex */
-    uint64_t hit_vram, hit_ram, miss_ssd, ssd_bytes, pf_reads, pf_hits, pf_used;
+    uint64_t hit_vram, hit_ram, miss_ssd, ssd_bytes, pf_reads, pf_hits, pf_used, demotions;
     double t_ssd, t_wait;
     uint32_t count[M2_NEXP];        /* routing profile */
 } m2_tiers;
@@ -928,6 +930,7 @@ static void tiers_init(m2_model *M, double vram_reserve_gb, int max_slots, doubl
     if (!T->slots) die("VRAM slot allocation failed");
     T->slot_owner = xmalloc((size_t)n * sizeof(int));
     T->slot_used = xcalloc((size_t)n, sizeof(uint64_t));
+    T->slot_tmp = xcalloc((size_t)n, 1);
     for (int i = 0; i < n; i++) T->slot_owner[i] = -1;
     for (int i = 0; i < M2_NEXP; i++) { T->slot_of[i] = -1; T->ram_of[i] = -1; }
 
@@ -949,16 +952,6 @@ static void tiers_init(m2_model *M, double vram_reserve_gb, int max_slots, doubl
     for (int i = 0; i < nr; i++) T->ram_owner[i] = -1;
     fprintf(stderr, "ds4-mimo2: tiers: %d VRAM slots (%.1f GB), %d RAM entries (%.1f GB pinned in %.1fs), %d routed experts\n",
             n, n * (double)M2_EXP_BYTES / 1e9, nr, nr * (double)T->ram_stride / 1e9, now_s() - t0, M2_NEXP - M2_NE);
-}
-
-/* Least recently used entry not touched in the current tick. */
-static int lru_pick(const uint64_t *used, int n, uint64_t tick) {
-    int best = -1;
-    uint64_t bu = UINT64_MAX;
-    for (int i = 0; i < n; i++) {
-        if (used[i] < bu && used[i] != tick) { bu = used[i]; best = i; if (bu == 0) break; }
-    }
-    return best;
 }
 
 static const uint8_t *ram_part(const m2_tiers *T, const m2_model *M, int r, int id, int part) {
@@ -996,9 +989,29 @@ static void ram_fill(m2_model *M, int r, int id, bool urgent) {
     }
 }
 
+/* A free RAM entry if there is one, else the least recently used; never one
+ * touched this tick or still being read from SSD. */
+static int ram_pick(m2_tiers *T) {
+    int best = -1;
+    uint64_t bu = UINT64_MAX;
+    for (int i = 0; i < T->nram; i++) {
+        if (T->ram_used[i] == T->tick || __atomic_load_n(&T->ram_pending[i], __ATOMIC_ACQUIRE)) continue;
+        const uint64_t u = T->ram_owner[i] < 0 ? 0 : T->ram_used[i] + 1;
+        if (u < bu) { bu = u; best = i; if (u == 0) break; }
+    }
+    return best;
+}
+
+/* The tiers are exclusive: once an expert is copied up to VRAM its RAM entry
+ * is released (kept from reuse until the tick ends, the copy is in flight). */
+static void ram_release(m2_tiers *T, int r) {
+    if (T->ram_owner[r] >= 0) T->ram_of[T->ram_owner[r]] = -1;
+    T->ram_owner[r] = -1;
+}
+
 static int ram_claim(m2_model *M, int id) {
     m2_tiers *T = &M->tr;
-    const int r = lru_pick(T->ram_used, T->nram, T->tick);
+    const int r = ram_pick(T);
     if (r < 0) die("RAM arena exhausted within one layer");
     if (T->ram_owner[r] >= 0) T->ram_of[T->ram_owner[r]] = -1;
     T->ram_owner[r] = id;
@@ -1006,6 +1019,27 @@ static int ram_claim(m2_model *M, int id) {
     T->ram_used[r] = T->tick;
     T->ram_pf[r] = 0;
     return r;
+}
+
+/* Copies the expert in VRAM slot s down into a RAM entry before the slot is
+ * reused. The device->host copy runs on its own stream, so it overlaps the
+ * uploads; the upload into slot s waits for it. */
+static void slot_demote(m2_model *M, int s) {
+    m2_tiers *T = &M->tr;
+    const int old = T->slot_owner[s];
+    const int tmp = T->slot_tmp[s];
+    T->slot_tmp[s] = 0;
+    if (old < 0) return;
+    T->slot_of[old] = -1;
+    T->slot_owner[s] = -1;
+    if (tmp || T->ram_of[old] >= 0) return;   /* still has a RAM copy (seeded, not yet released) */
+    const int r = ram_claim(M, old);
+    const uint8_t *src = T->slots + (size_t)s * M2_EXP_BYTES;
+    GCK(m2g_d2h_async((void *)ram_part(T, M, r, old, 0), src, M2_GATE_BYTES));
+    GCK(m2g_d2h_async((void *)ram_part(T, M, r, old, 1), src + M2_GATE_BYTES, M2_GATE_BYTES));
+    GCK(m2g_d2h_async((void *)ram_part(T, M, r, old, 2), src + 2 * M2_GATE_BYTES, M2_DOWN_BYTES));
+    GCK(m2g_d2h_order());
+    T->demotions++;
 }
 
 static void slot_copy_from_ram(m2_model *M, int s, int r, int id) {
@@ -1016,8 +1050,23 @@ static void slot_copy_from_ram(m2_model *M, int s, int r, int id) {
     GCK(m2g_copy_async(dst + 2 * M2_GATE_BYTES, ram_part(T, M, r, id, 2), M2_DOWN_BYTES));
 }
 
-/* Make every expert in need[0..n) resident in a VRAM slot for this tick. */
-static void tiers_fetch(m2_model *M, const int *need, int n, int *slot_out) {
+/* A free or streamed slot if there is one, else the least recently used. */
+static int slot_pick(m2_tiers *T) {
+    int best = -1;
+    uint64_t bu = UINT64_MAX;
+    for (int i = 0; i < T->nslots; i++) {
+        if (T->slot_used[i] == T->tick) continue;
+        const uint64_t u = T->slot_owner[i] < 0 || T->slot_tmp[i] ? 0 : T->slot_used[i] + 1;
+        if (u < bu) { bu = u; best = i; if (u == 0) break; }
+    }
+    return best;
+}
+
+/* Make every expert in need[0..n) resident in a VRAM slot for this tick.
+ * A batched pass (stream) touches nearly every expert of every layer, a scan
+ * far larger than the cache that would flush it under LRU, so it streams
+ * misses through transient slots and leaves the cached placement alone. */
+static void tiers_fetch(m2_model *M, const int *need, int n, int *slot_out, bool stream) {
     m2_tiers *T = &M->tr;
     T->tick++;
     int nmiss = 0, *miss = xmalloc((size_t)n * sizeof(int));
@@ -1025,7 +1074,13 @@ static void tiers_fetch(m2_model *M, const int *need, int n, int *slot_out) {
         const int id = need[i];
         T->count[id]++;
         const int s = T->slot_of[id];
-        if (s >= 0) { T->slot_used[s] = T->tick; slot_out[i] = s; T->hit_vram++; continue; }
+        if (s >= 0) {
+            T->slot_used[s] = T->tick;
+            if (!stream) T->slot_tmp[s] = 0;
+            slot_out[i] = s;
+            T->hit_vram++;
+            continue;
+        }
         miss[nmiss++] = i;
         if (T->ram_of[id] >= 0) T->hit_ram++;
     }
@@ -1059,14 +1114,17 @@ static void tiers_fetch(m2_model *M, const int *need, int n, int *slot_out) {
                 io_wait_ctr(&M->io, &T->ram_pending[T->ram_of[id]]);
                 T->t_ssd += now_s() - tw;
             }
-            const int s = lru_pick(T->slot_used, T->nslots, T->tick);
-        if (s < 0) die("VRAM slots exhausted within one layer");
-        if (T->slot_owner[s] >= 0) T->slot_of[T->slot_owner[s]] = -1;
-        T->slot_owner[s] = id;
-        T->slot_of[id] = s;
-        T->slot_used[s] = T->tick;
-        slot_copy_from_ram(M, s, T->ram_of[id], id);
-        slot_out[i] = s;
+            const int s = slot_pick(T);
+            if (s < 0) die("VRAM slots exhausted within one layer");
+            slot_demote(M, s);
+            const int r = T->ram_of[id];
+            T->slot_owner[s] = id;
+            T->slot_of[id] = s;
+            T->slot_used[s] = T->tick;
+            T->slot_tmp[s] = stream;
+            slot_copy_from_ram(M, s, r, id);
+            if (!stream || pass == 1) ram_release(T, r);   /* streamed RAM hits keep their place */
+            slot_out[i] = s;
         }
     }
     if (nmiss) GCK(m2g_copy_fence());
@@ -1142,6 +1200,25 @@ static void prefetch_ahead(m2_model *M, int l) {
     }
 }
 
+/* Where each job's expert lives before any copy: the split point for running
+ * RAM-tier experts on the CPU in place (Strata-style, branch cpu-hybrid). */
+enum { M2_AT_VRAM, M2_AT_RAM, M2_AT_SSD };
+
+static void tiers_where(const m2_model *M, const int *need, int n, uint8_t *where) {
+    const m2_tiers *T = &M->tr;
+    for (int i = 0; i < n; i++)
+        where[i] = T->slot_of[need[i]] >= 0 ? M2_AT_VRAM : T->ram_of[need[i]] >= 0 ? M2_AT_RAM : M2_AT_SSD;
+}
+
+/* Decides which jobs the CPU computes and moves them to the end of the job
+ * list, returning how many stay on the GPU. The CPU path is not built yet, so
+ * everything stays on the GPU. A CPU job would read ram_part() in place, write
+ * its rows of y, and be summed with the GPU's output after m2g_moe. */
+static int moe_cpu_split(const m2_model *M, int *need, int *expert_of_job, int nj, const uint8_t *where) {
+    (void)M; (void)need; (void)expert_of_job; (void)where;
+    return nj;
+}
+
 static void moe_layer(m2_model *M, int l, int n) {
     m2_layer *L = &M->L[l];
     GCK(m2g_matmul(M2_T_F32, L->router, M2_NE, M2_EMBD, M->xn, M2_EMBD, M->rlog, M2_NE, n, 0));
@@ -1157,7 +1234,11 @@ static void moe_layer(m2_model *M, int l, int n) {
     int slot[M2_NE];
     for (int j = 0; j < nj; j++) slot[j] = -1;
     if (n == 1 && M->lookahead > 0) prefetch_ahead(M, l);
-    tiers_fetch(M, need, nj, slot);
+    uint8_t where[M2_NE];
+    tiers_where(M, need, nj, where);
+    const int ngpu = moe_cpu_split(M, need, expert_of_job, nj, where);
+    if (ngpu != nj) die("CPU expert path not built");
+    tiers_fetch(M, need, ngpu, slot, n >= M2_STREAM_MIN);
     int job_of_e[M2_NE], fill[M2_NE];
     int off = 0;
     for (int j = 0; j < nj; j++) {
@@ -1256,15 +1337,17 @@ static void profile_seed(m2_model *M, const char *path) {
     if (!f) for (int i = 0; i < n; i++) rk[i].c = (uint32_t)(M2_NEXP - ((rk[i].id % M2_NE) * M2_NL + rk[i].id / M2_NE));
     qsort(rk, (size_t)n, sizeof(m2_rank), cmp_rank);
     const double t0 = now_s();
-    const int nram = T->nram < n ? T->nram : n;
+    /* exclusive tiers: the first nslots ranks go to VRAM (staged through RAM
+     * entries that are then released), the next nram ranks stay in RAM */
+    const int total = T->nslots + T->nram < n ? T->nslots + T->nram : n;
+    const int nvram = T->nslots < total ? T->nslots : total;
     const int batch = 64;
-    for (int i0 = 0; i0 < nram; i0 += batch) {
+    for (int i0 = 0; i0 < total; i0 += batch) {
         T->tick++;
-        const int i1 = i0 + batch < nram ? i0 + batch : nram;
+        const int i1 = i0 + batch < total ? i0 + batch : total;
         for (int i = i0; i < i1; i++) ram_fill(M, ram_claim(M, rk[i].id), rk[i].id, false);
         io_wait(&M->io);
-        for (int i = i0; i < i1; i++) {
-            if (i >= T->nslots) break;
+        for (int i = i0; i < i1 && i < nvram; i++) {
             const int id = rk[i].id, s = i;
             T->slot_owner[s] = id;
             T->slot_of[id] = s;
@@ -1272,13 +1355,14 @@ static void profile_seed(m2_model *M, const char *path) {
             slot_copy_from_ram(M, s, T->ram_of[id], id);
         }
         GCK(m2g_sync());
+        for (int i = i0; i < i1 && i < nvram; i++) ram_release(T, T->ram_of[rk[i].id]);
         if (M->verbose && (i0 / batch) % 20 == 0)
-            fprintf(stderr, "\rds4-mimo2: seeding %d/%d experts", i1, nram);
+            fprintf(stderr, "\rds4-mimo2: seeding %d/%d experts", i1, total);
     }
     T->tick++;
     const double dt = now_s() - t0;
     fprintf(stderr, "\rds4-mimo2: seeded %d VRAM + %d RAM experts from %s in %.1fs (%.2f GB/s from SSD)\n",
-            T->nslots < nram ? T->nslots : nram, nram, f ? path : "uniform order", dt, T->ssd_bytes / 1e9 / dt);
+            nvram, total - nvram, f ? path : "uniform order", dt, T->ssd_bytes / 1e9 / dt);
     T->ssd_bytes = 0;
     free(rk);
     free(c);
@@ -1338,6 +1422,8 @@ static void print_stats(const m2_model *M, const char *what, const m2_tiers *bef
     fprintf(stderr, "ds4-mimo2: %s experts: %llu lookups, VRAM %.1f%%, RAM %.1f%%, SSD %.1f%% (%.2f GB read)\n",
             what, (unsigned long long)tot, tot ? 100.0 * hv / tot : 0, tot ? 100.0 * hr / tot : 0,
             tot ? 100.0 * ms / tot : 0, (T->ssd_bytes - before->ssd_bytes) / 1e9);
+    fprintf(stderr, "ds4-mimo2: %s demotions VRAM->RAM: %llu, SSD wait %.1fs\n", what,
+            (unsigned long long)(T->demotions - before->demotions), T->t_ssd - before->t_ssd);
     if (T->pf_reads > before->pf_reads)
         fprintf(stderr, "ds4-mimo2: %s lookahead: %llu reads issued, %llu used (%llu still in flight)\n", what,
                 (unsigned long long)(T->pf_reads - before->pf_reads), (unsigned long long)(T->pf_used - before->pf_used),

@@ -39,6 +39,8 @@ int   m2g_upload(void *dst, const void *src, size_t bytes);           /* sync */
 int   m2g_upload_async(void *dst, const void *src, size_t bytes);     /* compute stream */
 int   m2g_copy_async(void *dst, const void *src, size_t bytes);       /* copy stream */
 int   m2g_download(void *dst, const void *src, size_t bytes);         /* sync */
+int   m2g_d2h_async(void *dst, const void *src, size_t bytes);        /* demotion stream */
+int   m2g_d2h_order(void);           /* later host->device copies wait for demotions so far */
 int   m2g_copy_fence(void);          /* compute stream waits for copies issued so far */
 int   m2g_sync(void);
 

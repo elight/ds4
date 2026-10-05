@@ -11,8 +11,8 @@
 #include <math.h>
 #include <stdio.h>
 
-static cudaStream_t g_s0, g_s1;
-static cudaEvent_t g_copy_ev;
+static cudaStream_t g_s0, g_s1, g_s2;   /* compute, host->device, device->host */
+static cudaEvent_t g_copy_ev, g_d2h_ev;
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "mimo2 cuda: %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); return -1; } } while (0)
@@ -21,6 +21,8 @@ extern "C" int m2g_init(void) {
     CK(cudaSetDevice(0));
     CK(cudaStreamCreateWithFlags(&g_s0, cudaStreamNonBlocking));
     CK(cudaStreamCreateWithFlags(&g_s1, cudaStreamNonBlocking));
+    CK(cudaStreamCreateWithFlags(&g_s2, cudaStreamNonBlocking));
+    CK(cudaEventCreateWithFlags(&g_d2h_ev, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&g_copy_ev, cudaEventDisableTiming));
     return 0;
 }
@@ -61,6 +63,17 @@ extern "C" int m2g_copy_async(void *dst, const void *src, size_t bytes) {
     return 0;
 }
 
+extern "C" int m2g_d2h_async(void *dst, const void *src, size_t bytes) {
+    CK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, g_s2));
+    return 0;
+}
+
+extern "C" int m2g_d2h_order(void) {
+    CK(cudaEventRecord(g_d2h_ev, g_s2));
+    CK(cudaStreamWaitEvent(g_s1, g_d2h_ev, 0));
+    return 0;
+}
+
 extern "C" int m2g_copy_fence(void) {
     CK(cudaEventRecord(g_copy_ev, g_s1));
     CK(cudaStreamWaitEvent(g_s0, g_copy_ev, 0));
@@ -76,6 +89,7 @@ extern "C" int m2g_download(void *dst, const void *src, size_t bytes) {
 extern "C" int m2g_sync(void) {
     CK(cudaStreamSynchronize(g_s0));
     CK(cudaStreamSynchronize(g_s1));
+    CK(cudaStreamSynchronize(g_s2));
     return 0;
 }
 
