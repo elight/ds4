@@ -15,6 +15,7 @@
  * The model graph mirrors llama.cpp src/models/mimo2.cpp (MIT). */
 #define _GNU_SOURCE
 #include "ds4_mimo2.h"
+#include "ds4_cpu_experts.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -747,8 +748,8 @@ typedef struct {
     uint64_t tick;
     int *ram_pending;
     char *ram_pf;                   /* filled by lookahead, not used yet */               /* parts still being read, guarded by the io mutex */
-    uint64_t hit_vram, hit_ram, miss_ssd, ssd_bytes, pf_reads, pf_hits, pf_used, demotions;
-    double t_ssd, t_wait;
+    uint64_t hit_vram, hit_ram, miss_ssd, ssd_bytes, pf_reads, pf_hits, pf_used, demotions, on_cpu;
+    double t_ssd, t_wait, t_cpu_wait;
     uint32_t count[M2_NEXP];        /* routing profile */
 } m2_tiers;
 
@@ -766,6 +767,10 @@ typedef struct {
     float *rlog_ahead, *h_rlog_ahead;
     int all_logits;     /* --score: logits for every token of a batch */
     int lookahead;
+    int cpu_experts;    /* decode: RAM-tier experts computed on the CPU in place */
+    int cpu_pcie;       /* ...except this many per layer, still copied up to VRAM */
+    ds4_cpu_expert_job cpu_jobs[M2_TOPK];
+    float *h_xn, *cpu_out, *h_cpu_y;
     float *x, *xn, *qkv, *att, *tmp, *gt, *u, *h, *y, *rlog, *logits, *wts;
     int *assign;
     m2_moe_job *jobs;
@@ -912,7 +917,11 @@ static void alloc_runtime(m2_model *M) {
     M->h_wts = m2g_host_alloc((size_t)U * M2_TOPK * sizeof(float));
     M->h_assign = m2g_host_alloc((size_t)U * M2_TOPK * sizeof(int));
     M->h_jobs = m2g_host_alloc(M2_NE * sizeof(m2_moe_job));
-    if (!M->h_x || !M->h_rlog || !M->h_logits || !M->h_wts || !M->h_assign || !M->h_jobs) die("pinned alloc failed");
+    M->h_xn = m2g_host_alloc(M2_EMBD * sizeof(float));
+    M->h_cpu_y = m2g_host_alloc(M2_EMBD * sizeof(float));
+    M->cpu_out = xmalloc((size_t)M2_TOPK * M2_EMBD * sizeof(float));
+    if (!M->h_x || !M->h_rlog || !M->h_logits || !M->h_wts || !M->h_assign || !M->h_jobs ||
+        !M->h_xn || !M->h_cpu_y) die("pinned alloc failed");
 }
 
 static size_t align_up(size_t x, size_t a) { return (x + a - 1) / a * a; }
@@ -1210,13 +1219,68 @@ static void tiers_where(const m2_model *M, const int *need, int n, uint8_t *wher
         where[i] = T->slot_of[need[i]] >= 0 ? M2_AT_VRAM : T->ram_of[need[i]] >= 0 ? M2_AT_RAM : M2_AT_SSD;
 }
 
+static const ds4_cpu_expert_shape m2_cpu_shape = {
+    M2_EMBD, M2_FF_EXP, DS4_CPU_EXPERT_Q2_K, DS4_CPU_EXPERT_MXFP4
+};
+
 /* Decides which jobs the CPU computes and moves them to the end of the job
- * list, returning how many stay on the GPU. The CPU path is not built yet, so
- * everything stays on the GPU. A CPU job would read ram_part() in place, write
- * its rows of y, and be summed with the GPU's output after m2g_moe. */
-static int moe_cpu_split(const m2_model *M, int *need, int *expert_of_job, int nj, const uint8_t *where) {
-    (void)M; (void)need; (void)expert_of_job; (void)where;
-    return nj;
+ * list, returning how many stay on the GPU. In decode, experts resident in RAM
+ * run on the CPU in place (Strata's split) instead of crossing PCIe, except
+ * for the first cpu_pcie of them, which still go up to VRAM. Experts still
+ * arriving from SSD stay on the GPU path. */
+static int moe_cpu_split(const m2_model *M, int *need, int *expert_of_job, int nj, const uint8_t *where, int n) {
+    if (!M->cpu_experts || n != 1) return nj;
+    int ngpu = nj, keep = M->cpu_pcie;
+    for (int j = nj - 1; j >= 0; j--) {
+        if (where[j] != M2_AT_RAM) continue;
+        const int r = M->tr.ram_of[need[j]];
+        if (__atomic_load_n(&M->tr.ram_pending[r], __ATOMIC_ACQUIRE)) continue;
+        if (keep > 0) { keep--; continue; }
+        ngpu--;
+        int t = need[j]; need[j] = need[ngpu]; need[ngpu] = t;
+        t = expert_of_job[j]; expert_of_job[j] = expert_of_job[ngpu]; expert_of_job[ngpu] = t;
+    }
+    return ngpu;
+}
+
+/* Queues jobs [ngpu, nj) on the CPU pool; returns how many. The RAM entries
+ * are marked used for the tick tiers_fetch is about to start, so nothing it
+ * reads or demotes this layer can land on them. */
+static int moe_cpu_submit(m2_model *M, const int *need, int ngpu, int nj) {
+    const int nc = nj - ngpu;
+    if (!nc) return 0;
+    m2_tiers *T = &M->tr;
+    GCK(m2g_download(M->h_xn, M->xn, M2_EMBD * sizeof(float)));
+    for (int c = 0; c < nc; c++) {
+        const int id = need[ngpu + c], r = T->ram_of[id];
+        T->ram_used[r] = T->tick + 1;
+        T->count[id]++;
+        T->hit_ram++;
+        M->cpu_jobs[c] = (ds4_cpu_expert_job){ ram_part(T, M, r, id, 0), ram_part(T, M, r, id, 1),
+                                               ram_part(T, M, r, id, 2), M->h_xn,
+                                               M->cpu_out + (size_t)c * M2_EMBD };
+    }
+    T->on_cpu += (uint64_t)nc;
+    if (!ds4_cpu_experts_submit(&m2_cpu_shape, M->cpu_jobs, (uint32_t)nc)) die("CPU expert submit failed");
+    return nc;
+}
+
+/* Waits for the CPU's experts and adds their weighted sum into the residual
+ * after the GPU's share, on the same stream. */
+static void moe_cpu_finish(m2_model *M, const int *expert_of_job, int ngpu, int nc, const int *ids) {
+    if (!nc) return;
+    M->tr.t_cpu_wait += ds4_cpu_experts_wait();
+    float *y = M->h_cpu_y;
+    memset(y, 0, M2_EMBD * sizeof(float));
+    for (int c = 0; c < nc; c++) {
+        const int e = expert_of_job[ngpu + c];
+        float w = 0.f;
+        for (int k = 0; k < M2_TOPK; k++) if (ids[k] == e) w = M->h_wts[k];
+        const float *o = M->cpu_out + (size_t)c * M2_EMBD;
+        for (int i = 0; i < M2_EMBD; i++) y[i] += w * o[i];
+    }
+    GCK(m2g_upload_async(M->tmp, y, M2_EMBD * sizeof(float)));
+    GCK(m2g_add(M->x, M->tmp, M2_EMBD));
 }
 
 static void moe_layer(m2_model *M, int l, int n) {
@@ -1236,12 +1300,13 @@ static void moe_layer(m2_model *M, int l, int n) {
     if (n == 1 && M->lookahead > 0) prefetch_ahead(M, l);
     uint8_t where[M2_NE];
     tiers_where(M, need, nj, where);
-    const int ngpu = moe_cpu_split(M, need, expert_of_job, nj, where);
-    if (ngpu != nj) die("CPU expert path not built");
+    const int ngpu = moe_cpu_split(M, need, expert_of_job, nj, where, n);
+    const int nc = moe_cpu_submit(M, need, ngpu, nj);
     tiers_fetch(M, need, ngpu, slot, n >= M2_STREAM_MIN);
     int job_of_e[M2_NE], fill[M2_NE];
+    for (int e = 0; e < M2_NE; e++) job_of_e[e] = -1;
     int off = 0;
-    for (int j = 0; j < nj; j++) {
+    for (int j = 0; j < ngpu; j++) {
         const int e = expert_of_job[j];
         job_of_e[e] = j;
         M->h_jobs[j] = (m2_moe_job){ M->tr.slots + (size_t)slot[j] * M2_EXP_BYTES, cnt[e], off };
@@ -1251,13 +1316,16 @@ static void moe_layer(m2_model *M, int l, int n) {
     for (int t = 0; t < n; t++)
         for (int k = 0; k < M2_TOPK; k++) {
             const int j = job_of_e[ids[t * M2_TOPK + k]];
-            M->h_assign[fill[j]++] = t * M2_TOPK + k;
+            if (j >= 0) M->h_assign[fill[j]++] = t * M2_TOPK + k;
         }
-    GCK(m2g_upload_async(M->jobs, M->h_jobs, (size_t)nj * sizeof(m2_moe_job)));
-    GCK(m2g_upload_async(M->assign, M->h_assign, (size_t)n * M2_TOPK * sizeof(int)));
-    GCK(m2g_upload_async(M->wts, M->h_wts, (size_t)n * M2_TOPK * sizeof(float)));
-    GCK(m2g_moe(M->jobs, nj, M->assign, M->wts, n, M2_TOPK, M->xn, M->h, M->y, M->x,
-                M2_EMBD, M2_FF_EXP, M2_GATE_BYTES, M2_GATE_BYTES));
+    if (ngpu) {
+        GCK(m2g_upload_async(M->jobs, M->h_jobs, (size_t)ngpu * sizeof(m2_moe_job)));
+        GCK(m2g_upload_async(M->assign, M->h_assign, (size_t)off * sizeof(int)));
+        GCK(m2g_upload_async(M->wts, M->h_wts, (size_t)n * M2_TOPK * sizeof(float)));
+        GCK(m2g_moe(M->jobs, ngpu, M->assign, M->wts, n, M2_TOPK, M->xn, M->h, M->y, M->x,
+                    M2_EMBD, M2_FF_EXP, M2_GATE_BYTES, M2_GATE_BYTES));
+    }
+    moe_cpu_finish(M, expert_of_job, ngpu, nc, ids);
     /* the pinned staging is reused next layer; the download there orders it */
 }
 
@@ -1393,6 +1461,8 @@ static void usage(void) {
         "  --score-from N     score only tokens from position N on\n"
         "  --io-threads N     SSD reader threads (default 8)\n"
         "  --lookahead N      decode: prefetch predicted experts N layers ahead (default 0, off)\n"
+        "  --cpu-experts 0|1  decode: compute RAM-tier experts on the CPU in place (default 1)\n"
+        "  --cpu-pcie N       ...but copy N of them per layer up to VRAM instead (default 0)\n"
         "  -v                 verbose\n");
     exit(2);
 }
@@ -1424,6 +1494,10 @@ static void print_stats(const m2_model *M, const char *what, const m2_tiers *bef
             tot ? 100.0 * ms / tot : 0, (T->ssd_bytes - before->ssd_bytes) / 1e9);
     fprintf(stderr, "ds4-mimo2: %s demotions VRAM->RAM: %llu, SSD wait %.1fs\n", what,
             (unsigned long long)(T->demotions - before->demotions), T->t_ssd - before->t_ssd);
+    if (T->on_cpu > before->on_cpu)
+        fprintf(stderr, "ds4-mimo2: %s RAM->CPU: %llu experts (%.1f%% of lookups), host idle waiting on CPU %.2fs\n", what,
+                (unsigned long long)(T->on_cpu - before->on_cpu), tot ? 100.0 * (T->on_cpu - before->on_cpu) / tot : 0,
+                T->t_cpu_wait - before->t_cpu_wait);
     if (T->pf_reads > before->pf_reads)
         fprintf(stderr, "ds4-mimo2: %s lookahead: %llu reads issued, %llu used (%llu still in flight)\n", what,
                 (unsigned long long)(T->pf_reads - before->pf_reads), (unsigned long long)(T->pf_used - before->pf_used),
@@ -1434,6 +1508,7 @@ int main(int argc, char **argv) {
     const char *model = NULL, *prompt = NULL, *pfile = NULL, *prof = NULL, *prof_out = NULL;
     int n_gen = 128, ctx = 8192, ubatch = 1024, raw = 0, think = 0, slots = -1, seed = 1, bench = 0;
     int show_tokens = 0, top_logits = 0, io_threads = 8, verbose = 0, lookahead = 0, score = 0, score_from = 0;
+    int cpu_experts = 1, cpu_pcie = 0;
     double ram_gb = -1, reserve = 0.6;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -1459,6 +1534,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--score-from")) score_from = atoi(NEXT());
         else if (!strcmp(a, "--io-threads")) io_threads = atoi(NEXT());
         else if (!strcmp(a, "--lookahead")) lookahead = atoi(NEXT());
+        else if (!strcmp(a, "--cpu-experts")) cpu_experts = atoi(NEXT());
+        else if (!strcmp(a, "--cpu-pcie")) cpu_pcie = atoi(NEXT());
         else if (!strcmp(a, "-v")) verbose = 1;
         else usage();
 #undef NEXT
@@ -1471,6 +1548,10 @@ int main(int argc, char **argv) {
     M.ubatch = ubatch;
     M.verbose = verbose;
     M.lookahead = lookahead;
+    M.cpu_experts = cpu_experts && ds4_cpu_experts_supported(&m2_cpu_shape);
+    M.cpu_pcie = cpu_pcie;
+    if (cpu_experts && !M.cpu_experts) fprintf(stderr, "ds4-mimo2: CPU experts unsupported here (needs AVX2), GPU only\n");
+    if (M.cpu_experts) ds4_cpu_experts_start();
     M.all_logits = score;
     if (score && ubatch > 64) M.ubatch = ubatch = 64;
     double t0 = now_s();

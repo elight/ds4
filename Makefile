@@ -357,13 +357,13 @@ ds4-agent: ds4_agent.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o li
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 # MiMo V2.6 Flash with the three-tier expert cache (docs/RAM_EXPERT_TIER.md).
-ds4_mimo2.o: ds4_mimo2.c ds4_mimo2.h ds4_qwen4_unicode.inc
+ds4_mimo2.o: ds4_mimo2.c ds4_mimo2.h ds4_cpu_experts.h ds4_qwen4_unicode.inc
 	$(CC) -O3 -march=native -mf16c -Wall -Wextra -Wno-unused-parameter -pthread -c -o $@ $<
 
 ds4_mimo2_cuda.o: ds4_mimo2_cuda.cu ds4_mimo2.h
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -c -o $@ $<
 
-ds4-mimo2: ds4_mimo2.o ds4_mimo2_cuda.o
+ds4-mimo2: ds4_mimo2.o ds4_mimo2_cuda.o ds4_cpu_experts.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 gguf-tools/quality-testing/score_official.o:gguf-tools/quality-testing/score_official.c ds4.h

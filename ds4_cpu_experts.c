@@ -67,6 +67,21 @@ typedef struct {
 _Static_assert(sizeof(cpu_block_q2_K) == 84, "q2_K block");
 _Static_assert(sizeof(cpu_block_iq2_xxs) == 66, "iq2_xxs block");
 
+/* MXFP4: 32 weights per 17-byte block, an E8M0 scale then 16 bytes of 4-bit
+ * E2M1 codes, weight j in the low nibble of byte j and weight j+16 in the
+ * high one (ggml block_mxfp4). */
+#define QK_MXFP4 32
+#define MXFP4_BLOCK 17
+static const int8_t kvalues_mxfp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+/* ggml's GGML_E8M0_TO_FP32_HALF: 2^(e-128), the half folded into the codes. */
+static inline float e8m0_half(uint8_t e) {
+    const uint32_t bits = e < 2 ? 0x00200000u << e : (uint32_t)(e - 1) << 23;
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
 #include "ds4_cpu_experts_grid.inc"
 
 /* Sign patterns: seven stored bits, the eighth makes the count of minus signs
@@ -110,6 +125,7 @@ uint64_t ds4_cpu_expert_row_bytes(uint32_t type, uint32_t K) {
     switch (type) {
     case DS4_CPU_EXPERT_Q2_K: return blocks * sizeof(cpu_block_q2_K);
     case DS4_CPU_EXPERT_IQ2_XXS: return blocks * sizeof(cpu_block_iq2_xxs);
+    case DS4_CPU_EXPERT_MXFP4: return (uint64_t)(K + QK_MXFP4 - 1) / QK_MXFP4 * MXFP4_BLOCK;
     default: return 0;
     }
 }
@@ -178,8 +194,19 @@ static void dequant_iq2_xxs(const cpu_block_iq2_xxs *x, float *y, uint32_t k) {
     }
 }
 
+static void dequant_mxfp4(const uint8_t *x, float *y, uint32_t k) {
+    for (uint32_t i = 0; i < k / QK_MXFP4; i++, x += MXFP4_BLOCK, y += QK_MXFP4) {
+        const float d = e8m0_half(x[0]);
+        for (int j = 0; j < 16; j++) {
+            y[j] = d * kvalues_mxfp4[x[1 + j] & 15];
+            y[j + 16] = d * kvalues_mxfp4[x[1 + j] >> 4];
+        }
+    }
+}
+
 static void dequant_row(uint32_t type, const void *row, float *y, uint32_t k) {
     if (type == DS4_CPU_EXPERT_Q2_K) dequant_q2_K(row, y, k);
+    else if (type == DS4_CPU_EXPERT_MXFP4) dequant_mxfp4(row, y, k);
     else dequant_iq2_xxs(row, y, k);
 }
 
@@ -282,8 +309,32 @@ static float dot_iq2_xxs(const cpu_block_iq2_xxs *x, const cpu_block_q8_K *y, ui
     return 0.125f * hsum_float_8(accumf);
 }
 
+/* After llama.cpp's ggml_vec_dot_mxfp4_q8_0 (AVX2), against Q8_K: eight
+ * MXFP4 blocks share each Q8_K block's scale. */
+static float dot_mxfp4(const uint8_t *x, const cpu_block_q8_K *y, uint32_t nb) {
+    const __m128i lut = _mm_loadu_si128((const __m128i *)kvalues_mxfp4);
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256 acc = _mm256_setzero_ps();
+    for (uint32_t i = 0; i < nb; ++i) {
+        const int8_t *q8 = y[i].qs;
+        for (int b = 0; b < QK_K / QK_MXFP4; b++, x += MXFP4_BLOCK, q8 += 32) {
+            const __m128i q4 = _mm_loadu_si128((const __m128i *)(x + 1));
+            const __m128i lo = _mm_shuffle_epi8(lut, _mm_and_si128(q4, m4));
+            const __m128i hi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(q4, 4), m4));
+            const __m256i w = _mm256_set_m128i(hi, lo);
+            const __m256i a = _mm256_loadu_si256((const __m256i *)q8);
+            const __m256i p = _mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(a, w));
+            const __m256i s = _mm256_madd_epi16(p, ones);
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(y[i].d * e8m0_half(x[0])), _mm256_cvtepi32_ps(s), acc);
+        }
+    }
+    return hsum_float_8(acc);
+}
+
 static inline float dot_row(uint32_t type, const void *row, const cpu_block_q8_K *y, uint32_t nb) {
-    return type == DS4_CPU_EXPERT_Q2_K ? dot_q2_K(row, y, nb) : dot_iq2_xxs(row, y, nb);
+    return type == DS4_CPU_EXPERT_Q2_K ? dot_q2_K(row, y, nb)
+         : type == DS4_CPU_EXPERT_MXFP4 ? dot_mxfp4(row, y, nb) : dot_iq2_xxs(row, y, nb);
 }
 #endif
 
@@ -292,7 +343,8 @@ static inline float silu(float x) { return x / (1.f + expf(-x)); }
 int ds4_cpu_experts_supported(const ds4_cpu_expert_shape *s) {
     if (!DS4_CPU_EXPERTS_SIMD || !s || !s->K || !s->M || s->K % QK_K) return 0;
     const int g = s->gate_type == DS4_CPU_EXPERT_Q2_K || s->gate_type == DS4_CPU_EXPERT_IQ2_XXS;
-    const int d = s->down_type == DS4_CPU_EXPERT_Q2_K || s->down_type == DS4_CPU_EXPERT_IQ2_XXS;
+    const int d = s->down_type == DS4_CPU_EXPERT_Q2_K || s->down_type == DS4_CPU_EXPERT_IQ2_XXS ||
+                  s->down_type == DS4_CPU_EXPERT_MXFP4;
     return g && d && s->M <= 16384;
 }
 

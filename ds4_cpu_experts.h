@@ -13,6 +13,7 @@ extern "C" {
 /* GGUF tensor types the kernels handle. */
 #define DS4_CPU_EXPERT_Q2_K    10u
 #define DS4_CPU_EXPERT_IQ2_XXS 16u
+#define DS4_CPU_EXPERT_MXFP4   39u  /* down projection only */
 
 /* One routed expert applied to one token: out = down(silu(gate x) * up x). */
 typedef struct {

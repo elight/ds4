@@ -22,6 +22,12 @@ static void *make_matrix(uint32_t type, uint32_t K, uint32_t rows, float scale) 
     const uint64_t rb = ds4_cpu_expert_row_bytes(type, K), n = rb * rows;
     uint8_t *m = aligned_alloc(64, (n + 63) / 64 * 64);
     for (uint64_t i = 0; i < n; i++) m[i] = (uint8_t)rnd();
+    if (type == DS4_CPU_EXPERT_MXFP4) {   /* E8M0 scales near scale / 8 */
+        const int e0 = 128 + (int)lrintf(log2f(scale)) - 3;
+        for (uint32_t r = 0; r < rows; r++)
+            for (uint32_t b = 0; b < K / 32; b++) m[r * rb + b * 17] = (uint8_t)(e0 + (int)(rnd() % 3) - 1);
+        return m;
+    }
     const uint32_t nb = (K + 255) / 256;
     for (uint32_t r = 0; r < rows; r++)
         for (uint32_t b = 0; b < nb; b++) {
@@ -129,6 +135,10 @@ int main(void) {
     /* IQ2_XXS down too. */
     const ds4_cpu_expert_shape iq = {512, 256, DS4_CPU_EXPERT_IQ2_XXS, DS4_CPU_EXPERT_IQ2_XXS};
     fail |= run_shape("iq2_xxs/iq2_xxs 1 x 3", iq, 3, 1);
+    /* MiMo V2.6 Flash: Q2_K gate/up, MXFP4 down, 4096 x 2048. */
+    const ds4_cpu_expert_shape mimo = {4096, 2048, DS4_CPU_EXPERT_Q2_K, DS4_CPU_EXPERT_MXFP4};
+    fail |= run_shape("mimo2 1 token x 1", mimo, 1, 1);
+    fail |= run_shape("mimo2 1 token x 8", mimo, 8, 1);
     printf(fail ? "FAILED\n" : "all passed\n");
     return fail;
 }
