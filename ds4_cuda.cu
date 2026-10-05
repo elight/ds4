@@ -34345,7 +34345,7 @@ static struct {
  * so the slot cache keeps learning. The share adapts: when the GPU finishes
  * first, more goes over PCIe; when the CPU finishes first, less does. */
 static struct {
-    bool init, enabled, adapt, armed, submitted;
+    bool init, enabled, adapt, armed, submitted, exact, ran_exact;
     double pcie_frac, carry;
     const ds4_gpu_tensor *x;
     ds4_cpu_expert_shape shape;
@@ -34369,6 +34369,9 @@ static void cuda_hybrid_init(void) {
     g_hybrid.adapt = !(frac && frac[0]);
     g_hybrid.pcie_frac = frac && frac[0] ? std::min(1.0, std::max(0.0, atof(frac))) : 0.3;
     g_stream_stats.pcie_frac = g_hybrid.pcie_frac;
+    /* Parity check only: the scalar float path, serial, no overlap. */
+    const char *exact = getenv("DS4_CPU_HYBRID_EXACT");
+    g_hybrid.exact = exact && exact[0] && strcmp(exact, "0");
 }
 
 extern "C" int ds4_gpu_qwen4_cpu_hybrid_arm(const ds4_gpu_tensor *x, uint32_t T, uint32_t K, uint32_t M,
@@ -34415,7 +34418,8 @@ static const uint32_t HYBRID_MAX_JOBS = 64;
  * g_stream_cpu_skip and starts the pool on them. */
 static bool cuda_hybrid_plan(const ds4_gpu_stream_expert_table *table, const int32_t *ids, uint32_t n_selected) {
     auto &h = g_hybrid;
-    if (h.submitted) { ds4_cpu_experts_wait(); h.submitted = false; }
+    if (h.submitted && !h.ran_exact) ds4_cpu_experts_wait();
+    h.submitted = false;
     const uint32_t T = h.T, K = h.shape.K;
     if (!T || n_selected % T || n_selected > HYBRID_MAX_JOBS) return true;
     const uint32_t NS = n_selected / T;
@@ -34465,7 +34469,10 @@ static bool cuda_hybrid_plan(const ds4_gpu_stream_expert_table *table, const int
         h.pair[j] = (int32_t)i;
         j++;
     }
-    if (!ds4_cpu_experts_submit(&h.shape, h.jobs.data(), n_jobs)) {
+    h.ran_exact = h.exact;
+    if (h.exact) {
+        for (uint32_t j = 0; j < n_jobs; j++) ds4_cpu_expert_ref(&h.shape, &h.jobs[j], 0);
+    } else if (!ds4_cpu_experts_submit(&h.shape, h.jobs.data(), n_jobs)) {
         h.skip.clear();
         return true;
     }
@@ -34492,7 +34499,7 @@ extern "C" int ds4_gpu_qwen4_cpu_hybrid_finish(ds4_gpu_tensor *part, uint32_t st
     cudaStream_t s = cuda_decode_stream();
     /* Everything the GPU had for this layer is queued: mark its end. */
     if (!cuda_ok(cudaEventRecord(h.gpu_done, s), "hybrid GPU mark")) return 0;
-    g_stream_stats.cpu_wait_sec += ds4_cpu_experts_wait();
+    if (!h.ran_exact) g_stream_stats.cpu_wait_sec += ds4_cpu_experts_wait();
     g_stream_stats.cpu_layers++;
     if (h.adapt) {
         /* GPU still busy: the CPU has room for more. GPU idle: it waited. */
