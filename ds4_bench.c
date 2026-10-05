@@ -57,6 +57,8 @@ typedef struct {
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
+    uint64_t ram_expert_cache_bytes;
+    bool ram_expert_cache_set;
     uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
@@ -332,6 +334,13 @@ static bench_config parse_options(int argc, char **argv) {
             c.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ram-expert-cache")) {
+            if (!ds4_parse_ram_expert_cache_arg(need_arg(&i, argc, argv, arg),
+                                                &c.ram_expert_cache_bytes)) {
+                fprintf(stderr, "ds4-bench: --ram-expert-cache must be auto, 0, <number>GB or <number>MB\n");
+                exit(2);
+            }
+            c.ram_expert_cache_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
             uint32_t experts = 0;
             uint64_t bytes = 0;
@@ -656,6 +665,8 @@ int main(int argc, char **argv) {
         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
         .ssd_streaming_full_layers = cfg.ssd_streaming_full_layers,
         .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
+        .ram_expert_cache_bytes = cfg.ram_expert_cache_bytes,
+        .ram_expert_cache_set = cfg.ram_expert_cache_set,
         .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,

@@ -21,6 +21,9 @@ bool ds4_parse_streaming_cache_experts_arg(const char *s,
                                            uint32_t   *experts,
                                            uint64_t   *bytes);
 
+/* --ram-expert-cache: "auto" (UINT64_MAX), "0" (off), NGB, NG, NMB or NM. */
+bool ds4_parse_ram_expert_cache_arg(const char *s, uint64_t *bytes);
+
 uint32_t ds4_ssd_cache_experts_for_byte_budget(uint64_t bytes,
                                                uint64_t per_expert_bytes);
 bool ds4_ssd_auto_cache_plan(uint64_t            recommended_bytes,

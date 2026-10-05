@@ -148,6 +148,10 @@ typedef struct {
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
+    /* Pinned host-RAM expert tier under the streaming VRAM cache. Unset
+     * means DS4_RAM_EXPERT_CACHE, else auto; UINT64_MAX is auto, 0 is off. */
+    uint64_t ram_expert_cache_bytes;
+    bool ram_expert_cache_set;
     uint64_t simulate_used_memory_bytes;
     bool warm_weights;
     bool quality;

@@ -2060,6 +2060,13 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ram-expert-cache")) {
+            if (!ds4_parse_ram_expert_cache_arg(need_arg(&i, argc, argv, arg),
+                                                &c.engine.ram_expert_cache_bytes)) {
+                fprintf(stderr, "ds4: --ram-expert-cache must be auto, 0, <number>GB or <number>MB\n");
+                exit(2);
+            }
+            c.engine.ram_expert_cache_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
             uint32_t experts = 0;
             uint64_t bytes = 0;

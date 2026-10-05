@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -66,6 +67,26 @@ bool ds4_parse_streaming_cache_experts_arg(const char *s,
     if (errno != 0 || v == 0 || v > UINT32_MAX) return false;
 
     *experts = (uint32_t)v;
+    return true;
+}
+
+bool ds4_parse_ram_expert_cache_arg(const char *s, uint64_t *bytes) {
+    if (bytes) *bytes = 0;
+    if (!s || !s[0] || !bytes) return false;
+    if (!strcmp(s, "auto")) {
+        *bytes = UINT64_MAX;
+        return true;
+    }
+    errno = 0;
+    char *end = NULL;
+    const unsigned long long v = strtoull(s, &end, 10);
+    if (errno != 0 || end == s) return false;
+    uint64_t unit = 0;
+    if (!strcmp(end, "") && v == 0) unit = 1;
+    else if (!strcasecmp(end, "G") || !strcasecmp(end, "GB")) unit = DS4_GIB;
+    else if (!strcasecmp(end, "M") || !strcasecmp(end, "MB")) unit = DS4_GIB / 1024u;
+    if (!unit || v > UINT64_MAX / unit) return false;
+    *bytes = (uint64_t)v * unit;
     return true;
 }
 
