@@ -75,6 +75,8 @@ VRAM hit rate, RAM hit rate, SSD bytes per token. Results go in the table below.
 | 2026-10-05 | MiMo V2.6 Flash Q2_K | 4+6: RAM tier on CPU | 4.75 | — | 32.6% | story run; 59.5% of decode lookups computed on the CPU in place, SSD 7.9% |
 | 2026-10-05 | MiMo V2.6 Flash Q2_K | 6, same window | 3.65 | — | 65.8% | `--cpu-experts 0`, back to back with the row above |
 | 2026-10-05 | MiMo V2.6 Flash Q2_K | llama.cpp, same window | 5.04 | — | — | story run; faster than the 4.08 row, likely a warmer page cache |
+| 2026-10-05 | MiMo V2.6 Flash Q2_K | 4+6, MTP 1 draft | 4.95 | — | — | 96-token story; 76% of drafts kept, 1.76 tokens per verify pass; 4.90 without MTP in the same window |
+| 2026-10-05 | MiMo V2.6 Flash Q2_K | 4+6, MTP 3 drafts | 3.24 | — | — | same run; 34% kept, 2.02 tokens/pass; a 4-token pass reads about 2.7x the experts of a one-token step |
 
 RTX 3090, PCIe gen3, ctx 8192, 128 generated tokens, 5575 VRAM slots (7.7 GiB).
 Command: `ds4-bench -m Qwen3.8-Flash-Next-Q2.gguf --cuda --ssd-streaming
@@ -120,3 +122,20 @@ token per step (`misc/llmbox/mimo2-score-decode.sh`) gives ppl 1.799 and 95.5%
 top-1 agreement with the split, 1.802 and 95.5% without. Story decode goes
 3.65 → 4.75 t/s; the host never waits on the CPU (0.09 s per run), so the
 SSD (14.5 s of the 33.5 s) is what is left.
+
+**MTP** (`--mtp mtp-MiMo-V2.6-Flash-RL-Q8_0.gguf`, `--mtp-draft N`, 1-3,
+default 1) loads the nextn heads the way llama.cpp chains them: head i drafts
+the token i+1 ahead from the previous head's output, and the trunk checks all
+drafts in one batch. The heads take about 1.05 GB of VRAM; they reuse the
+trunk's Q6_K output and embeddings instead of the file's Q8_0 copies. With
+`--cpu-experts 0` greedy output is byte-identical with and without MTP
+(`misc/llmbox/mimo2-mtp.sh`). With the CPU split on, plain greedy output
+already differs from run to run, because which experts land on the CPU depends
+on SSD timing, so the two cannot be compared byte for byte.
+
+MTP barely pays here. Decode is bound by expert reads, and a verify pass of
+k+1 tokens reads the union of their experts, so it costs nearly as much per
+token as plain decode. One draft is a wash (+1%); three drafts lose a third,
+because the second and third drafts are kept in only 23% and 9% of passes.
+Drafting itself costs 3.6 ms per pass on the GPU against a ~355 ms pass.
+

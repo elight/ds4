@@ -86,6 +86,12 @@ extern "C" int m2g_download(void *dst, const void *src, size_t bytes) {
     return 0;
 }
 
+extern "C" int m2g_copy_rows(float *dst, int ldd, const float *src, int lds, int n, int rows) {
+    CK(cudaMemcpy2DAsync(dst, (size_t)ldd * sizeof(float), src, (size_t)lds * sizeof(float),
+                         (size_t)n * sizeof(float), (size_t)rows, cudaMemcpyDeviceToDevice, g_s0));
+    return 0;
+}
+
 extern "C" int m2g_sync(void) {
     CK(cudaStreamSynchronize(g_s0));
     CK(cudaStreamSynchronize(g_s1));

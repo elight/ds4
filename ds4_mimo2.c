@@ -729,6 +729,8 @@ static void io_wait(m2_iopool *p) {
 
 #define M2_NEXP (M2_NL * M2_NE)
 #define M2_STREAM_MIN 256         /* batch size from which a layer streams its misses */
+#define M2_CPU_NMAX 8             /* batches up to this size share their experts with the CPU */
+#define M2_MTP_MAX 3              /* MTP heads, so drafts per step */
 
 typedef struct {
     int nslots;
@@ -753,6 +755,16 @@ typedef struct {
     uint32_t count[M2_NEXP];        /* routing profile */
 } m2_tiers;
 
+/* One MTP (nextn) head. The hidden state of position p-1 and the token at p
+ * go through hnorm/enorm, eh_proj, one sliding-window attention layer and a
+ * dense FFN; the result feeds the next head, and its norm under the trunk's
+ * lm head predicts the token at p+1. */
+typedef struct {
+    m2_layer L;
+    const float *enorm, *hnorm, *head_norm;      /* device */
+    const void *eh_proj;                         /* Q8_0 [4096][8192] */
+} m2_mtp_head;
+
 typedef struct {
     m2_gguf g;
     m2_vocab vb;
@@ -769,9 +781,16 @@ typedef struct {
     int lookahead;
     int cpu_experts;    /* decode: RAM-tier experts computed on the CPU in place */
     int cpu_pcie;       /* ...except this many per layer, still copied up to VRAM */
-    ds4_cpu_expert_job cpu_jobs[M2_TOPK];
-    float cpu_w[M2_TOPK];
+    ds4_cpu_expert_job cpu_jobs[M2_CPU_NMAX * M2_TOPK];
+    float cpu_w[M2_CPU_NMAX * M2_TOPK];
+    int cpu_tok[M2_CPU_NMAX * M2_TOPK];
     float *h_xn, *cpu_out, *h_cpu_y;
+    /* MTP: heads from a separate GGUF */
+    m2_gguf mg;
+    int n_mtp;                      /* heads loaded, 0 without --mtp */
+    m2_mtp_head mh[M2_MTP_MAX];
+    float *hin, *hx, *hcat, *pend;  /* device: head h inputs, head residual, [e|h], pending h */
+    int n_logits;                   /* rows the logits buffers hold */
     float *x, *xn, *qkv, *att, *tmp, *gt, *u, *h, *y, *rlog, *logits, *wts;
     int *assign;
     m2_moe_job *jobs;
@@ -885,6 +904,66 @@ static void model_upload(m2_model *M) {
     }
 }
 
+/* Loads the first n MTP heads (blk.48..) into VRAM. The MTP GGUF carries its
+ * own token_embd and output (Q8_0); the trunk's embedding and Q6_K lm head
+ * stand in for them, which keeps 0.6 GB of VRAM for expert slots and only
+ * shades the drafts, never the verified output. */
+static void mtp_load(m2_model *M, const char *path, int n) {
+    m2_gguf *g = &M->mg;
+    gguf_open(g, path, false);
+    const m2_kv *arch = gguf_kv(g, "general.architecture");
+    if (!arch || memcmp(arch->val + 8, "mimo2", 5) != 0) die("%s is not a mimo2 GGUF", path);
+    const int have = (int)gguf_int(g, "mimo2.nextn_predict_layers", 0);
+    if (have < n) die("%s has %d MTP heads, --mtp asked for %d", path, have, n);
+    const int nl = (int)gguf_int(g, "mimo2.block_count", 0);
+    if (nl != M2_NL + have) die("%s: block_count %d, expected %d", path, nl, M2_NL + have);
+    int n_kv[M2_NL + M2_MTP_MAX + 1], swa[M2_NL + M2_MTP_MAX + 1];
+    if (nl > M2_NL + M2_MTP_MAX + 1 ||
+        gguf_arr_i32(g, "mimo2.attention.head_count_kv", n_kv, nl) != nl ||
+        gguf_arr_i32(g, "mimo2.attention.sliding_window_pattern", swa, nl) != nl)
+        die("%s: per-layer attention arrays missing", path);
+    const float base_full = (float)gguf_float(g, "mimo2.rope.freq_base", 1e7);
+    const float base_swa = (float)gguf_float(g, "mimo2.rope.freq_base_swa", 1e4);
+    for (int i = 0; i < n; i++) {
+        const int l = M2_NL + i;
+        m2_mtp_head *H = &M->mh[i];
+        m2_layer *L = &H->L;
+        L->swa = swa[l];
+        L->n_kv = n_kv[l];
+        L->rope_base = L->swa ? base_swa : base_full;
+        L->attn_norm = upload_tensor(g, layer_tensor(g, l, "attn_norm.weight", true));
+        L->ffn_norm = upload_tensor(g, layer_tensor(g, l, "ffn_norm.weight", true));
+        const m2_tensor *s = layer_tensor(g, l, "attn_sinks.weight", false);
+        L->sinks = s ? upload_tensor(g, s) : NULL;
+        const m2_tensor *qkv = layer_tensor(g, l, "attn_qkv.weight", true);
+        L->qkv_rows = M2_NHEAD * M2_HK + L->n_kv * (M2_HK + M2_HV);
+        check_tensor(qkv, M2_T_Q8_0, M2_EMBD, (uint64_t)L->qkv_rows, 0);
+        L->qkv = upload_tensor(g, qkv);
+        const m2_tensor *wo = layer_tensor(g, l, "attn_output.weight", true);
+        check_tensor(wo, M2_T_Q8_0, M2_NHEAD * M2_HV, M2_EMBD, 0);
+        L->wo = upload_tensor(g, wo);
+        const m2_tensor *fg = layer_tensor(g, l, "ffn_gate.weight", true);
+        const m2_tensor *fu = layer_tensor(g, l, "ffn_up.weight", true);
+        const m2_tensor *fd = layer_tensor(g, l, "ffn_down.weight", true);
+        check_tensor(fg, M2_T_Q8_0, M2_EMBD, M2_FF, 0);
+        check_tensor(fu, M2_T_Q8_0, M2_EMBD, M2_FF, 0);
+        check_tensor(fd, M2_T_Q8_0, M2_FF, M2_EMBD, 0);
+        L->ffn_gate = upload_tensor(g, fg);
+        L->ffn_up = upload_tensor(g, fu);
+        L->ffn_down = upload_tensor(g, fd);
+        const m2_tensor *eh = layer_tensor(g, l, "nextn.eh_proj.weight", true);
+        check_tensor(eh, M2_T_Q8_0, 2 * M2_EMBD, M2_EMBD, 0);
+        H->eh_proj = upload_tensor(g, eh);
+        H->enorm = upload_tensor(g, layer_tensor(g, l, "nextn.enorm.weight", true));
+        H->hnorm = upload_tensor(g, layer_tensor(g, l, "nextn.hnorm.weight", true));
+        /* llama.cpp's fallback order: shared_head_norm, layer_output_norm, output_norm */
+        const m2_tensor *hn = layer_tensor(g, l, "nextn.shared_head_norm.weight", false);
+        if (!hn) hn = layer_tensor(g, l, "layer_output_norm.weight", false);
+        H->head_norm = hn ? upload_tensor(g, hn) : M->out_norm;
+    }
+    M->n_mtp = n;
+}
+
 static void alloc_runtime(m2_model *M) {
     const int U = M->ubatch;
     for (int l = 0; l < M2_NL; l++) {
@@ -894,6 +973,14 @@ static void alloc_runtime(m2_model *M) {
         L->vc = m2g_alloc((size_t)L->cache_len * L->n_kv * M2_HV * 2);
         if (!L->kc || !L->vc) die("out of VRAM for the KV cache");
     }
+    for (int i = 0; i < M->n_mtp; i++) {
+        m2_layer *L = &M->mh[i].L;
+        L->cache_len = L->swa ? (U + M2_SWA) : M->ctx;
+        L->kc = m2g_alloc((size_t)L->cache_len * L->n_kv * M2_HK * 2);
+        L->vc = m2g_alloc((size_t)L->cache_len * L->n_kv * M2_HV * 2);
+        if (!L->kc || !L->vc) die("out of VRAM for the MTP KV cache");
+    }
+    M->n_logits = M->all_logits ? U : M->n_mtp + 1;
 #define DALLOC(p, n) do { (p) = m2g_alloc((size_t)(n) * sizeof(*(p))); if (!(p)) die("out of VRAM (" #p ")"); } while (0)
     DALLOC(M->x, (size_t)U * M2_EMBD);
     DALLOC(M->xn, (size_t)U * M2_EMBD);
@@ -906,7 +993,16 @@ static void alloc_runtime(m2_model *M) {
     DALLOC(M->y, (size_t)U * M2_TOPK * M2_EMBD);
     DALLOC(M->rlog, (size_t)U * M2_NE);
     DALLOC(M->rlog_ahead, (size_t)M2_NL * M2_NE);
-    DALLOC(M->logits, (size_t)M->vb.n_vocab * (M->all_logits ? U : 1));
+    DALLOC(M->logits, (size_t)M->vb.n_vocab * M->n_logits);
+    if (M->n_mtp) {
+        DALLOC(M->hin, (size_t)(U + M2_MTP_MAX + 2) * M2_EMBD);
+        DALLOC(M->hx, (size_t)(U + M2_MTP_MAX + 2) * M2_EMBD);
+        DALLOC(M->hcat, (size_t)(U + M2_MTP_MAX + 2) * 2 * M2_EMBD);
+        DALLOC(M->pend, M2_EMBD);
+        float *zero = xcalloc(M2_EMBD, sizeof(float));
+        GCK(m2g_upload(M->pend, zero, M2_EMBD * sizeof(float)));
+        free(zero);
+    }
     DALLOC(M->wts, (size_t)U * M2_TOPK);
     DALLOC(M->assign, (size_t)U * M2_TOPK);
     DALLOC(M->jobs, M2_NE);
@@ -914,13 +1010,13 @@ static void alloc_runtime(m2_model *M) {
     M->h_x = m2g_host_alloc((size_t)U * M2_EMBD * sizeof(float));
     M->h_rlog = m2g_host_alloc((size_t)U * M2_NE * sizeof(float));
     M->h_rlog_ahead = m2g_host_alloc((size_t)M2_NL * M2_NE * sizeof(float));
-    M->h_logits = m2g_host_alloc((size_t)M->vb.n_vocab * (M->all_logits ? U : 1) * sizeof(float));
+    M->h_logits = m2g_host_alloc((size_t)M->vb.n_vocab * M->n_logits * sizeof(float));
     M->h_wts = m2g_host_alloc((size_t)U * M2_TOPK * sizeof(float));
     M->h_assign = m2g_host_alloc((size_t)U * M2_TOPK * sizeof(int));
     M->h_jobs = m2g_host_alloc(M2_NE * sizeof(m2_moe_job));
-    M->h_xn = m2g_host_alloc(M2_EMBD * sizeof(float));
-    M->h_cpu_y = m2g_host_alloc(M2_EMBD * sizeof(float));
-    M->cpu_out = xmalloc((size_t)M2_TOPK * M2_EMBD * sizeof(float));
+    M->h_xn = m2g_host_alloc((size_t)M2_CPU_NMAX * M2_EMBD * sizeof(float));
+    M->h_cpu_y = m2g_host_alloc((size_t)M2_CPU_NMAX * M2_EMBD * sizeof(float));
+    M->cpu_out = xmalloc((size_t)M2_CPU_NMAX * M2_TOPK * M2_EMBD * sizeof(float));
     if (!M->h_x || !M->h_rlog || !M->h_logits || !M->h_wts || !M->h_assign || !M->h_jobs ||
         !M->h_xn || !M->h_cpu_y) die("pinned alloc failed");
 }
@@ -1225,12 +1321,13 @@ static const ds4_cpu_expert_shape m2_cpu_shape = {
 };
 
 /* Decides which jobs the CPU computes and moves them to the end of the job
- * list, returning how many stay on the GPU. In decode, experts resident in RAM
+ * list, returning how many stay on the GPU. In decode and in MTP's small
+ * verify batches (up to M2_CPU_NMAX tokens), experts resident in RAM
  * run on the CPU in place (Strata's split) instead of crossing PCIe, except
  * for the first cpu_pcie of them, which still go up to VRAM. Experts still
  * arriving from SSD stay on the GPU path. */
 static int moe_cpu_split(const m2_model *M, int *need, int *expert_of_job, int nj, const uint8_t *where, int n) {
-    if (!M->cpu_experts || n != 1) return nj;
+    if (!M->cpu_experts || n > M2_CPU_NMAX) return nj;
     int ngpu = nj, keep = M->cpu_pcie;
     for (int j = nj - 1; j >= 0; j--) {
         if (where[j] != M2_AT_RAM) continue;
@@ -1244,48 +1341,54 @@ static int moe_cpu_split(const m2_model *M, int *need, int *expert_of_job, int n
     return ngpu;
 }
 
-/* Queues jobs [ngpu, nj) on the CPU pool; returns how many. The RAM entries
- * are marked used for the tick tiers_fetch is about to start, so nothing it
- * reads or demotes this layer can land on them. Each CPU expert's router
- * weight moves to cpu_w and is zeroed in h_wts, so the GPU's combine, which
- * walks all top-k slots, skips it. */
+/* Queues experts [ngpu, nj) on the CPU pool, one job per token routed to
+ * each; returns the job count. The RAM entries are marked used for the tick
+ * tiers_fetch is about to start, so nothing it reads or demotes this layer
+ * can land on them. Each job's router weight moves to cpu_w and is zeroed in
+ * h_wts, so the GPU's combine, which walks all top-k slots, skips it. */
 static int moe_cpu_submit(m2_model *M, const int *need, const int *expert_of_job, const int *ids,
-                          int ngpu, int nj) {
-    const int nc = nj - ngpu;
-    if (!nc) return 0;
+                          int ngpu, int nj, int n) {
+    if (nj == ngpu) return 0;
     m2_tiers *T = &M->tr;
-    for (int c = 0; c < nc; c++)
-        for (int k = 0; k < M2_TOPK; k++)
-            if (ids[k] == expert_of_job[ngpu + c]) { M->cpu_w[c] = M->h_wts[k]; M->h_wts[k] = 0.f; }
-    GCK(m2g_download(M->h_xn, M->xn, M2_EMBD * sizeof(float)));
-    for (int c = 0; c < nc; c++) {
-        const int id = need[ngpu + c], r = T->ram_of[id];
+    GCK(m2g_download(M->h_xn, M->xn, (size_t)n * M2_EMBD * sizeof(float)));
+    int nc = 0;
+    for (int c = ngpu; c < nj; c++) {
+        const int id = need[c], r = T->ram_of[id], e = expert_of_job[c];
         T->ram_used[r] = T->tick + 1;
         T->count[id]++;
         T->hit_ram++;
-        M->cpu_jobs[c] = (ds4_cpu_expert_job){ ram_part(T, M, r, id, 0), ram_part(T, M, r, id, 1),
-                                               ram_part(T, M, r, id, 2), M->h_xn,
-                                               M->cpu_out + (size_t)c * M2_EMBD };
+        for (int t = 0; t < n; t++)
+            for (int k = 0; k < M2_TOPK; k++) {
+                if (ids[t * M2_TOPK + k] != e) continue;
+                M->cpu_w[nc] = M->h_wts[t * M2_TOPK + k];
+                M->h_wts[t * M2_TOPK + k] = 0.f;
+                M->cpu_tok[nc] = t;
+                M->cpu_jobs[nc] = (ds4_cpu_expert_job){ ram_part(T, M, r, id, 0), ram_part(T, M, r, id, 1),
+                                                        ram_part(T, M, r, id, 2), M->h_xn + (size_t)t * M2_EMBD,
+                                                        M->cpu_out + (size_t)nc * M2_EMBD };
+                nc++;
+            }
     }
-    T->on_cpu += (uint64_t)nc;
+    T->on_cpu += (uint64_t)(nj - ngpu);
     if (!ds4_cpu_experts_submit(&m2_cpu_shape, M->cpu_jobs, (uint32_t)nc)) die("CPU expert submit failed");
     return nc;
 }
 
-/* Waits for the CPU's experts and adds their weighted sum into the residual
+/* Waits for the CPU's jobs and adds their weighted sums into the residual
  * after the GPU's share, on the same stream. */
-static void moe_cpu_finish(m2_model *M, int nc) {
+static void moe_cpu_finish(m2_model *M, int nc, int n) {
     if (!nc) return;
     M->tr.t_cpu_wait += ds4_cpu_experts_wait();
     float *y = M->h_cpu_y;
-    memset(y, 0, M2_EMBD * sizeof(float));
+    memset(y, 0, (size_t)n * M2_EMBD * sizeof(float));
     for (int c = 0; c < nc; c++) {
         const float w = M->cpu_w[c];
         const float *o = M->cpu_out + (size_t)c * M2_EMBD;
-        for (int i = 0; i < M2_EMBD; i++) y[i] += w * o[i];
+        float *yt = y + (size_t)M->cpu_tok[c] * M2_EMBD;
+        for (int i = 0; i < M2_EMBD; i++) yt[i] += w * o[i];
     }
-    GCK(m2g_upload_async(M->tmp, y, M2_EMBD * sizeof(float)));
-    GCK(m2g_add(M->x, M->tmp, M2_EMBD));
+    GCK(m2g_upload_async(M->tmp, y, (size_t)n * M2_EMBD * sizeof(float)));
+    GCK(m2g_add(M->x, M->tmp, n * M2_EMBD));
 }
 
 static void moe_layer(m2_model *M, int l, int n) {
@@ -1306,7 +1409,7 @@ static void moe_layer(m2_model *M, int l, int n) {
     uint8_t where[M2_NE];
     tiers_where(M, need, nj, where);
     const int ngpu = moe_cpu_split(M, need, expert_of_job, nj, where, n);
-    const int nc = moe_cpu_submit(M, need, expert_of_job, ids, ngpu, nj);
+    const int nc = moe_cpu_submit(M, need, expert_of_job, ids, ngpu, nj, n);
     tiers_fetch(M, need, ngpu, slot, n >= M2_STREAM_MIN);
     int job_of_e[M2_NE], fill[M2_NE];
     for (int e = 0; e < M2_NE; e++) job_of_e[e] = -1;
@@ -1330,40 +1433,44 @@ static void moe_layer(m2_model *M, int l, int n) {
         GCK(m2g_moe(M->jobs, ngpu, M->assign, M->wts, n, M2_TOPK, M->xn, M->h, M->y, M->x,
                     M2_EMBD, M2_FF_EXP, M2_GATE_BYTES, M2_GATE_BYTES));
     }
-    moe_cpu_finish(M, nc);
+    moe_cpu_finish(M, nc, n);
     /* the pinned staging is reused next layer; the download there orders it */
 }
 
-/* Runs n tokens at positions pos0.. through the model; if want_logits, the
- * logits of the last token land in M->h_logits. */
-static void forward(m2_model *M, const int *tok, int n, int pos0, bool want_logits) {
+/* Runs n tokens at positions pos0.. through the model; the logits of the last
+ * nl tokens land in M->h_logits, and M->x keeps every token's final hidden
+ * state (before output_norm), which the MTP heads take as input. */
+/* Attention, then the FFN, on the residual x: dense when the layer has one,
+ * else routed experts (trunk layer l). */
+static void layer_body(m2_model *M, m2_layer *L, int l, float *x, int n, int pos0) {
+    const int ldq = L->qkv_rows;
+    GCK(m2g_rmsnorm(x, L->attn_norm, M->xn, M2_EMBD, n, M2_EPS));
+    GCK(m2g_matmul(M2_T_Q8_0, L->qkv, ldq, M2_EMBD, M->xn, M2_EMBD, M->qkv, ldq, n, 0));
+    GCK(m2g_attention(M->qkv, n, pos0, M2_NHEAD, L->n_kv, M2_NROT, L->rope_base,
+                      L->swa ? M2_SWA : 0, L->kc, L->vc, L->cache_len, L->sinks, M->att));
+    GCK(m2g_matmul(M2_T_Q8_0, L->wo, M2_EMBD, M2_NHEAD * M2_HV, M->att, M2_NHEAD * M2_HV,
+                   M->tmp, M2_EMBD, n, 0));
+    GCK(m2g_scale(M->tmp, M2_VSCALE, n * M2_EMBD));
+    GCK(m2g_add(x, M->tmp, n * M2_EMBD));
+    GCK(m2g_rmsnorm(x, L->ffn_norm, M->xn, M2_EMBD, n, M2_EPS));
+    if (L->ffn_gate) {
+        GCK(m2g_matmul(M2_T_Q8_0, L->ffn_gate, M2_FF, M2_EMBD, M->xn, M2_EMBD, M->gt, M2_FF, n, 0));
+        GCK(m2g_matmul(M2_T_Q8_0, L->ffn_up, M2_FF, M2_EMBD, M->xn, M2_EMBD, M->u, M2_FF, n, 0));
+        GCK(m2g_swiglu2(M->gt, M->u, M->gt, n * M2_FF));
+        GCK(m2g_matmul(M2_T_Q8_0, L->ffn_down, M2_EMBD, M2_FF, M->gt, M2_FF, x, M2_EMBD, n, 1));
+    } else {
+        moe_layer(M, l, n);
+    }
+}
+
+static void forward(m2_model *M, const int *tok, int n, int pos0, int nl) {
     if (n > M->ubatch) die("batch %d exceeds ubatch %d", n, M->ubatch);
     if (pos0 + n > M->ctx) die("context full (%d)", M->ctx);
     embed_rows(M, tok, n, M->h_x);
     GCK(m2g_upload_async(M->x, M->h_x, (size_t)n * M2_EMBD * sizeof(float)));
-    for (int l = 0; l < M2_NL; l++) {
-        m2_layer *L = &M->L[l];
-        const int ldq = L->qkv_rows;
-        GCK(m2g_rmsnorm(M->x, L->attn_norm, M->xn, M2_EMBD, n, M2_EPS));
-        GCK(m2g_matmul(M2_T_Q8_0, L->qkv, ldq, M2_EMBD, M->xn, M2_EMBD, M->qkv, ldq, n, 0));
-        GCK(m2g_attention(M->qkv, n, pos0, M2_NHEAD, L->n_kv, M2_NROT, L->rope_base,
-                          L->swa ? M2_SWA : 0, L->kc, L->vc, L->cache_len, L->sinks, M->att));
-        GCK(m2g_matmul(M2_T_Q8_0, L->wo, M2_EMBD, M2_NHEAD * M2_HV, M->att, M2_NHEAD * M2_HV,
-                       M->tmp, M2_EMBD, n, 0));
-        GCK(m2g_scale(M->tmp, M2_VSCALE, n * M2_EMBD));
-        GCK(m2g_add(M->x, M->tmp, n * M2_EMBD));
-        GCK(m2g_rmsnorm(M->x, L->ffn_norm, M->xn, M2_EMBD, n, M2_EPS));
-        if (L->ffn_gate) {
-            GCK(m2g_matmul(M2_T_Q8_0, L->ffn_gate, M2_FF, M2_EMBD, M->xn, M2_EMBD, M->gt, M2_FF, n, 0));
-            GCK(m2g_matmul(M2_T_Q8_0, L->ffn_up, M2_FF, M2_EMBD, M->xn, M2_EMBD, M->u, M2_FF, n, 0));
-            GCK(m2g_swiglu2(M->gt, M->u, M->gt, n * M2_FF));
-            GCK(m2g_matmul(M2_T_Q8_0, L->ffn_down, M2_EMBD, M2_FF, M->gt, M2_FF, M->x, M2_EMBD, n, 1));
-        } else {
-            moe_layer(M, l, n);
-        }
-    }
-    if (want_logits) {
-        const int nl = M->all_logits ? n : 1;
+    for (int l = 0; l < M2_NL; l++) layer_body(M, &M->L[l], l, M->x, n, pos0);
+    if (nl > M->n_logits) die("%d logit rows exceed %d", nl, M->n_logits);
+    if (nl > 0) {
         const float *rows = M->x + (size_t)(n - nl) * M2_EMBD;
         GCK(m2g_rmsnorm(rows, M->out_norm, M->xn, M2_EMBD, nl, M2_EPS));
         GCK(m2g_matmul(M2_T_Q6_K, M->output, M->vb.n_vocab, M2_EMBD, M->xn, M2_EMBD, M->logits, M->vb.n_vocab, nl, 0));
@@ -1371,6 +1478,46 @@ static void forward(m2_model *M, const int *tok, int n, int pos0, bool want_logi
     } else {
         GCK(m2g_sync());
     }
+}
+
+/* ---- MTP: draft with the nextn heads, verify with the trunk --------------- */
+
+/* Runs head hi over m rows at positions pos0..: row r is token tok[r] paired
+ * with the hidden state in M->hin row r (the state of the position before).
+ * The rows rebuild this head's KV from pos0 on. If want, returns the head's
+ * greedy token for the last row and copies that row's output into M->hin row
+ * m, where the next head picks it up (llama.cpp's chained heads). */
+static int mtp_head(m2_model *M, int hi, const int *tok, int m, int pos0, bool want) {
+    m2_mtp_head *H = &M->mh[hi];
+    if (m > M->ubatch) die("MTP batch %d exceeds ubatch %d", m, M->ubatch);
+    GCK(m2g_sync());   /* h_x may still be feeding an earlier upload */
+    embed_rows(M, tok, m, M->h_x);
+    GCK(m2g_upload_async(M->hx, M->h_x, (size_t)m * M2_EMBD * sizeof(float)));
+    GCK(m2g_rmsnorm(M->hx, H->enorm, M->xn, M2_EMBD, m, M2_EPS));
+    GCK(m2g_copy_rows(M->hcat, 2 * M2_EMBD, M->xn, M2_EMBD, M2_EMBD, m));
+    GCK(m2g_rmsnorm(M->hin, H->hnorm, M->xn, M2_EMBD, m, M2_EPS));
+    GCK(m2g_copy_rows(M->hcat + M2_EMBD, 2 * M2_EMBD, M->xn, M2_EMBD, M2_EMBD, m));
+    GCK(m2g_matmul(M2_T_Q8_0, H->eh_proj, M2_EMBD, 2 * M2_EMBD, M->hcat, 2 * M2_EMBD, M->hx, M2_EMBD, m, 0));
+    layer_body(M, &H->L, -1, M->hx, m, pos0);
+    if (!want) return -1;
+    const float *last = M->hx + (size_t)(m - 1) * M2_EMBD;
+    GCK(m2g_copy_rows(M->hin + (size_t)m * M2_EMBD, M2_EMBD, last, M2_EMBD, M2_EMBD, 1));
+    GCK(m2g_rmsnorm(last, H->head_norm, M->xn, M2_EMBD, 1, M2_EPS));
+    GCK(m2g_matmul(M2_T_Q6_K, M->output, M->vb.n_vocab, M2_EMBD, M->xn, M2_EMBD, M->logits, M->vb.n_vocab, 1, 0));
+    GCK(m2g_download(M->h_logits, M->logits, (size_t)M->vb.n_vocab * sizeof(float)));
+    int b = 0;
+    for (int v = 1; v < M->vb.n_vocab; v++) if (M->h_logits[v] > M->h_logits[b]) b = v;
+    return b;
+}
+
+/* Prefill: after the trunk ran tok[0..n) at pos0, every head takes the same
+ * rows into its KV, each token paired with the trunk's state one position
+ * back. M->pend carries the last state across batches (zero before the first). */
+static void mtp_catchup(m2_model *M, const int *tok, int n, int pos0) {
+    GCK(m2g_copy_rows(M->hin, M2_EMBD, M->pend, M2_EMBD, M2_EMBD, 1));
+    if (n > 1) GCK(m2g_copy_rows(M->hin + M2_EMBD, M2_EMBD, M->x, M2_EMBD, M2_EMBD, n - 1));
+    GCK(m2g_copy_rows(M->pend, M2_EMBD, M->x + (size_t)(n - 1) * M2_EMBD, M2_EMBD, M2_EMBD, 1));
+    for (int i = 0; i < M->n_mtp; i++) mtp_head(M, i, tok, n, pos0, false);
 }
 
 /* ---- profile -------------------------------------------------------------- */
@@ -1468,6 +1615,8 @@ static void usage(void) {
         "  --lookahead N      decode: prefetch predicted experts N layers ahead (default 0, off)\n"
         "  --cpu-experts 0|1  decode: compute RAM-tier experts on the CPU in place (default 1)\n"
         "  --cpu-pcie N       ...but copy N of them per layer up to VRAM instead (default 0)\n"
+        "  --mtp FILE         decode with MTP: draft with the nextn heads in FILE, verify in one batch\n"
+        "  --mtp-draft N      drafts per step, 1-3 (default 1)\n"
         "  -v                 verbose\n");
     exit(2);
 }
@@ -1513,7 +1662,8 @@ int main(int argc, char **argv) {
     const char *model = NULL, *prompt = NULL, *pfile = NULL, *prof = NULL, *prof_out = NULL;
     int n_gen = 128, ctx = 8192, ubatch = 1024, raw = 0, think = 0, slots = -1, seed = 1, bench = 0;
     int show_tokens = 0, top_logits = 0, io_threads = 8, verbose = 0, lookahead = 0, score = 0, score_from = 0;
-    int cpu_experts = 1, cpu_pcie = 0;
+    int cpu_experts = 1, cpu_pcie = 0, mtp_draft = 1;
+    const char *mtp_path = NULL;
     double ram_gb = -1, reserve = 0.6;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -1541,6 +1691,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--lookahead")) lookahead = atoi(NEXT());
         else if (!strcmp(a, "--cpu-experts")) cpu_experts = atoi(NEXT());
         else if (!strcmp(a, "--cpu-pcie")) cpu_pcie = atoi(NEXT());
+        else if (!strcmp(a, "--mtp")) mtp_path = NEXT();
+        else if (!strcmp(a, "--mtp-draft")) mtp_draft = atoi(NEXT());
         else if (!strcmp(a, "-v")) verbose = 1;
         else usage();
 #undef NEXT
@@ -1602,6 +1754,10 @@ int main(int argc, char **argv) {
 
     GCK(m2g_init());
     model_upload(&M);
+    if (mtp_path && !score) {
+        if (mtp_draft < 1 || mtp_draft > M2_MTP_MAX) die("--mtp-draft must be 1..%d", M2_MTP_MAX);
+        mtp_load(&M, mtp_path, mtp_draft);
+    }
     alloc_runtime(&M);
     fprintf(stderr, "ds4-mimo2: non-routed weights in VRAM in %.1fs\n", now_s() - t0);
     io_init(&M.io, io_threads < 1 ? 1 : io_threads > 16 ? 16 : io_threads);
@@ -1618,7 +1774,7 @@ int main(int argc, char **argv) {
         int agree = 0, cnt = 0;
         for (int i = 0; i < pt.n - 1; i += M.ubatch) {
             const int nb = pt.n - 1 - i < M.ubatch ? pt.n - 1 - i : M.ubatch;
-            forward(&M, pt.v + i, nb, i, true);
+            forward(&M, pt.v + i, nb, i, nb);
             for (int t = 0; t < nb; t++) {
                 const int pos = i + t, next = pt.v[pos + 1];
                 if (pos + 1 < score_from) continue;
@@ -1648,6 +1804,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < pt.n; i += M.ubatch) {
         const int nb = pt.n - i < M.ubatch ? pt.n - i : M.ubatch;
         forward(&M, pt.v + i, nb, i, i + nb == pt.n);
+        if (M.n_mtp) mtp_catchup(&M, pt.v + i, nb, i);
     }
     tp = now_s() - tp;
     fprintf(stderr, "ds4-mimo2: prefill %d tokens in %.2fs = %.2f t/s\n", pt.n, tp, pt.n / tp);
@@ -1669,26 +1826,103 @@ int main(int argc, char **argv) {
     /* greedy decode */
     snap = M.tr;
     double td = now_s();
-    int pos = pt.n, ngen = 0, nfwd = 0;
+    int pos = pt.n, ngen = 0, nfwd = 0, nprod = 0;
     int tok = argmax(M.h_logits, M.vb.n_vocab);
-    for (; ngen < n_gen; ngen++) {
-        if (!bench && (tok == M.vb.eos || tok == M.vb.im_end || tok == M.vb.eot)) break;
-        if (!bench) {
-            char piece[256];
-            const int pl = detok(&M.vb, tok, piece, (int)sizeof piece);
-            fwrite(piece, 1, (size_t)pl, stdout);
-            fflush(stdout);
+    long drafted = 0, accepted = 0;
+    double t_draft = 0;
+    long acc_at[M2_MTP_MAX] = { 0 };
+    if (M.n_mtp) {
+        /* Each step: the heads draft d1..dk after tok, the trunk runs
+         * [tok, d1..dk] in one batch, and the longest prefix of drafts that
+         * matches the trunk's own greedy picks is kept, plus the trunk's next
+         * token after it. dtok/M.hin hold the rows the heads still have to
+         * take into their KV (from position base on), then tok. */
+        int dtok[2 * M2_MTP_MAX + 4], ntk = 1, base = pos;
+        dtok[0] = tok;
+        GCK(m2g_copy_rows(M.hin, M2_EMBD, M.pend, M2_EMBD, M2_EMBD, 1));
+        for (;;) {
+            if (!bench && (tok == M.vb.eos || tok == M.vb.im_end || tok == M.vb.eot)) break;
+            if (!bench) {
+                char piece[256];
+                const int pl = detok(&M.vb, tok, piece, (int)sizeof piece);
+                fwrite(piece, 1, (size_t)pl, stdout);
+                fflush(stdout);
+            }
+            if (++ngen == n_gen) break;
+            int k = M.n_mtp;
+            if (k > M.ctx - pos - 1) k = M.ctx - pos - 1;
+            if (k < 0) die("context full (%d)", M.ctx);
+            const double t0 = now_s();
+            for (int i = 0; i < k; i++) dtok[ntk + i] = mtp_head(&M, i, dtok, ntk + i, base, true);
+            t_draft += now_s() - t0;
+            const int *vt = dtok + ntk - 1;
+            forward(&M, vt, k + 1, pos, k + 1);
+            nfwd++;
+            drafted += k;
+            int a = 0, next = argmax(M.h_logits, M.vb.n_vocab);
+            while (a < k && vt[a + 1] == next) {
+                a++;
+                next = argmax(M.h_logits + (size_t)a * M.vb.n_vocab, M.vb.n_vocab);
+            }
+            accepted += a;
+            for (int j = 0; j < a; j++) acc_at[j]++;
+            nprod += a + 1;
+            /* the heads' next rows: the committed tokens at pos..pos+a with
+             * the state one position back, then next with the state of pos+a */
+            GCK(m2g_copy_rows(M.hin, M2_EMBD, M.pend, M2_EMBD, M2_EMBD, 1));
+            GCK(m2g_copy_rows(M.hin + M2_EMBD, M2_EMBD, M.x, M2_EMBD, M2_EMBD, a + 1));
+            GCK(m2g_copy_rows(M.pend, M2_EMBD, M.x + (size_t)a * M2_EMBD, M2_EMBD, M2_EMBD, 1));
+            int nt[2 * M2_MTP_MAX + 4];
+            for (int j = 0; j <= a; j++) nt[j] = vt[j];
+            nt[a + 1] = next;
+            ntk = a + 2;
+            memcpy(dtok, nt, (size_t)ntk * sizeof(int));
+            base = pos;
+            pos += a + 1;
+            /* print the accepted drafts; the loop head prints next */
+            bool stop = false;
+            for (int j = 1; j <= a && !stop; j++) {
+                const int t = nt[j];
+                if (!bench && (t == M.vb.eos || t == M.vb.im_end || t == M.vb.eot)) { stop = true; break; }
+                if (!bench) {
+                    char piece[256];
+                    const int pl = detok(&M.vb, t, piece, (int)sizeof piece);
+                    fwrite(piece, 1, (size_t)pl, stdout);
+                    fflush(stdout);
+                }
+                if (++ngen == n_gen) stop = true;
+            }
+            if (stop) break;
+            tok = next;
         }
-        if (ngen + 1 == n_gen) { ngen++; break; }
-        forward(&M, &tok, 1, pos++, true);
-        nfwd++;
-        tok = argmax(M.h_logits, M.vb.n_vocab);
+    } else {
+        for (; ngen < n_gen; ngen++) {
+            if (!bench && (tok == M.vb.eos || tok == M.vb.im_end || tok == M.vb.eot)) break;
+            if (!bench) {
+                char piece[256];
+                const int pl = detok(&M.vb, tok, piece, (int)sizeof piece);
+                fwrite(piece, 1, (size_t)pl, stdout);
+                fflush(stdout);
+            }
+            if (ngen + 1 == n_gen) { ngen++; break; }
+            forward(&M, &tok, 1, pos++, 1);
+            nfwd++;
+            nprod++;
+            tok = argmax(M.h_logits, M.vb.n_vocab);
+        }
     }
     td = now_s() - td;
     if (!bench) printf("\n");
-    const int ndec = nfwd;
+    const int ndec = nprod;
     fprintf(stderr, "ds4-mimo2: decode %d tokens in %.2fs = %.2f t/s (SSD wait %.2fs)\n",
             ndec, td, ndec ? ndec / td : 0, M.tr.t_ssd - snap.t_ssd);
+    if (M.n_mtp)
+        fprintf(stderr, "ds4-mimo2: MTP %d verify passes, %ld drafted, %ld accepted (%.1f%%), %.2f tokens/pass\n",
+                nfwd, drafted, accepted, drafted ? 100.0 * accepted / drafted : 0, nfwd ? (double)nprod / nfwd : 0);
+    if (M.n_mtp)
+        fprintf(stderr, "ds4-mimo2: MTP drafting %.2fs (%.1f ms/pass), draft i kept in %ld/%ld/%ld passes\n",
+                t_draft, nfwd ? 1e3 * t_draft / nfwd : 0, acc_at[0], M2_MTP_MAX > 1 ? acc_at[1] : 0,
+                M2_MTP_MAX > 2 ? acc_at[2] : 0);
     print_stats(&M, "decode", &snap);
     if (prof_out) profile_save(&M, prof_out);
     return 0;

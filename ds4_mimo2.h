@@ -43,6 +43,8 @@ int   m2g_d2h_async(void *dst, const void *src, size_t bytes);        /* demotio
 int   m2g_d2h_order(void);           /* later host->device copies wait for demotions so far */
 int   m2g_copy_fence(void);          /* compute stream waits for copies issued so far */
 int   m2g_sync(void);
+/* rows x n floats, device to device on the compute stream; strides in floats */
+int   m2g_copy_rows(float *dst, int ldd, const float *src, int lds, int n, int rows);
 
 /* y[t][r] = sum_k W[r][k] x[t][k]; W is rows x cols in GGUF type `type`. */
 int m2g_matmul(int type, const void *W, int rows, int cols,
