@@ -356,7 +356,17 @@ ds4-eval: ds4_eval.o ds4_eval_cases.o ds4_help.o $(CORE_OBJS)
 ds4-agent: ds4_agent.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-gguf-tools/quality-testing/score_official.o: gguf-tools/quality-testing/score_official.c ds4.h
+# MiMo V2.6 Flash with the three-tier expert cache (docs/RAM_EXPERT_TIER.md).
+ds4_mimo2.o: ds4_mimo2.c ds4_mimo2.h ds4_qwen4_unicode.inc
+	$(CC) -O3 -march=native -mf16c -Wall -Wextra -Wno-unused-parameter -pthread -c -o $@ $<
+
+ds4_mimo2_cuda.o: ds4_mimo2_cuda.cu ds4_mimo2.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -c -o $@ $<
+
+ds4-mimo2: ds4_mimo2.o ds4_mimo2_cuda.o
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+gguf-tools/quality-testing/score_official.o:gguf-tools/quality-testing/score_official.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(QUALITY_CFLAGS)) $(ROCM_HOST_CFLAGS) -I. -c -o $@ $<
 
 gguf-tools/quality-testing/score_official: gguf-tools/quality-testing/score_official.o $(CORE_OBJS) rax.o ds4_gpu_args.o
