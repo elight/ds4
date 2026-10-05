@@ -4,8 +4,11 @@
 # equal greedy output without it.
 # Run inside the GPU window:
 #   ~/claude-tmp/gpu-window.sh --max 600 -- misc/llmbox/mimo2-mtp.sh OUTDIR
-# Env: CPUS="0 1" (CPU-expert settings), MODES="plain mtp3" (mtpK drafts K
-# tokens; a mode whose output file exists is reused), N=128 (tokens), EXTRA=...
+# Env: CPUS="0 1" (CPU-expert settings), MODES="plain mtp3", N=128 (tokens),
+# EXTRA=... (pass --slots N so every mode gets the same VRAM tiers).
+# Modes: plain (any name starting "plain"), mtpK = K drafts, mtpKg70 = gate
+# later drafts at p 0.70, mtpKg70f50 = also gate the first at 0.50. A mode
+# whose output file exists is reused unless REUSE=0.
 set -u
 OUT=${1:?usage: $0 OUTDIR}
 mkdir -p "$OUT"
@@ -20,7 +23,11 @@ for cpu in ${CPUS:-0 1}; do
     f="$OUT/mtp-cpu$cpu-$mode"
     [ -s "$f.txt" ] && [ "${REUSE:-1}" = 1 ] && { echo "=== cpu-experts $cpu, $mode (reused)"; continue; }
     args=()
-    [ "$mode" != plain ] && args=(--mtp "$MTP" --mtp-draft "${mode#mtp}")
+    case $mode in
+      mtp*) d=${mode#mtp}; args=(--mtp "$MTP" --mtp-draft "${d%%[gf]*}")
+            [[ $mode =~ g([0-9]+) ]] && args+=(--mtp-gate "0.${BASH_REMATCH[1]}")
+            [[ $mode =~ f([0-9]+) ]] && args+=(--mtp-gate-first "0.${BASH_REMATCH[1]}") ;;
+    esac
     echo "=== cpu-experts $cpu, $mode"
     "$HERE/ds4-mimo2" -m "$M" -p "$Q" -n "$N" --ctx 4096 --cpu-experts "$cpu" "${args[@]}" ${EXTRA:-} \
       > "$f.txt" 2> "$f.err"

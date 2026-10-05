@@ -1485,9 +1485,10 @@ static void forward(m2_model *M, const int *tok, int n, int pos0, int nl) {
 /* Runs head hi over m rows at positions pos0..: row r is token tok[r] paired
  * with the hidden state in M->hin row r (the state of the position before).
  * The rows rebuild this head's KV from pos0 on. If want, returns the head's
- * greedy token for the last row and copies that row's output into M->hin row
- * m, where the next head picks it up (llama.cpp's chained heads). */
-static int mtp_head(m2_model *M, int hi, const int *tok, int m, int pos0, bool want) {
+ * greedy token for the last row, sets *pmax to its softmax probability, and
+ * copies that row's output into M->hin row m, where the next head picks it up
+ * (llama.cpp's chained heads). */
+static int mtp_head(m2_model *M, int hi, const int *tok, int m, int pos0, bool want, float *pmax) {
     m2_mtp_head *H = &M->mh[hi];
     if (m > M->ubatch) die("MTP batch %d exceeds ubatch %d", m, M->ubatch);
     GCK(m2g_sync());   /* h_x may still be feeding an earlier upload */
@@ -1505,8 +1506,12 @@ static int mtp_head(m2_model *M, int hi, const int *tok, int m, int pos0, bool w
     GCK(m2g_rmsnorm(last, H->head_norm, M->xn, M2_EMBD, 1, M2_EPS));
     GCK(m2g_matmul(M2_T_Q6_K, M->output, M->vb.n_vocab, M2_EMBD, M->xn, M2_EMBD, M->logits, M->vb.n_vocab, 1, 0));
     GCK(m2g_download(M->h_logits, M->logits, (size_t)M->vb.n_vocab * sizeof(float)));
+    const float *lg = M->h_logits;
     int b = 0;
-    for (int v = 1; v < M->vb.n_vocab; v++) if (M->h_logits[v] > M->h_logits[b]) b = v;
+    for (int v = 1; v < M->vb.n_vocab; v++) if (lg[v] > lg[b]) b = v;
+    double z = 0;
+    for (int v = 0; v < M->vb.n_vocab; v++) z += exp((double)(lg[v] - lg[b]));
+    *pmax = (float)(1.0 / z);
     return b;
 }
 
@@ -1517,7 +1522,7 @@ static void mtp_catchup(m2_model *M, const int *tok, int n, int pos0) {
     GCK(m2g_copy_rows(M->hin, M2_EMBD, M->pend, M2_EMBD, M2_EMBD, 1));
     if (n > 1) GCK(m2g_copy_rows(M->hin + M2_EMBD, M2_EMBD, M->x, M2_EMBD, M2_EMBD, n - 1));
     GCK(m2g_copy_rows(M->pend, M2_EMBD, M->x + (size_t)(n - 1) * M2_EMBD, M2_EMBD, M2_EMBD, 1));
-    for (int i = 0; i < M->n_mtp; i++) mtp_head(M, i, tok, n, pos0, false);
+    for (int i = 0; i < M->n_mtp; i++) mtp_head(M, i, tok, n, pos0, false, NULL);
 }
 
 /* ---- profile -------------------------------------------------------------- */
@@ -1617,6 +1622,9 @@ static void usage(void) {
         "  --cpu-pcie N       ...but copy N of them per layer up to VRAM instead (default 0)\n"
         "  --mtp FILE         decode with MTP: draft with the nextn heads in FILE, verify in one batch\n"
         "  --mtp-draft N      drafts per step, 1-3 (default 1)\n"
+        "  --mtp-gate P       stop drafting when a head's top probability is below P\n"
+        "                     (default 0; the first draft is always kept)\n"
+        "  --mtp-gate-first P gate the first draft too (default 0)\n"
         "  -v                 verbose\n");
     exit(2);
 }
@@ -1663,6 +1671,7 @@ int main(int argc, char **argv) {
     int n_gen = 128, ctx = 8192, ubatch = 1024, raw = 0, think = 0, slots = -1, seed = 1, bench = 0;
     int show_tokens = 0, top_logits = 0, io_threads = 8, verbose = 0, lookahead = 0, score = 0, score_from = 0;
     int cpu_experts = 1, cpu_pcie = 0, mtp_draft = 1;
+    float mtp_gate = 0, mtp_gate1 = 0;
     const char *mtp_path = NULL;
     double ram_gb = -1, reserve = 0.6;
     for (int i = 1; i < argc; i++) {
@@ -1693,6 +1702,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--cpu-pcie")) cpu_pcie = atoi(NEXT());
         else if (!strcmp(a, "--mtp")) mtp_path = NEXT();
         else if (!strcmp(a, "--mtp-draft")) mtp_draft = atoi(NEXT());
+        else if (!strcmp(a, "--mtp-gate")) mtp_gate = (float)atof(NEXT());
+        else if (!strcmp(a, "--mtp-gate-first")) mtp_gate1 = (float)atof(NEXT());
         else if (!strcmp(a, "-v")) verbose = 1;
         else usage();
 #undef NEXT
@@ -1830,7 +1841,7 @@ int main(int argc, char **argv) {
     int tok = argmax(M.h_logits, M.vb.n_vocab);
     long drafted = 0, accepted = 0;
     double t_draft = 0;
-    long acc_at[M2_MTP_MAX] = { 0 };
+    long acc_at[M2_MTP_MAX] = { 0 }, gated = 0, npass_k[M2_MTP_MAX + 1] = { 0 };
     if (M.n_mtp) {
         /* Each step: the heads draft d1..dk after tok, the trunk runs
          * [tok, d1..dk] in one batch, and the longest prefix of drafts that
@@ -1853,7 +1864,22 @@ int main(int argc, char **argv) {
             if (k > M.ctx - pos - 1) k = M.ctx - pos - 1;
             if (k < 0) die("context full (%d)", M.ctx);
             const double t0 = now_s();
-            for (int i = 0; i < k; i++) dtok[ntk + i] = mtp_head(&M, i, dtok, ntk + i, base, true);
+            /* chain heads while each is confident; a head below the gate
+             * ends the chain, and the heads after it still take the
+             * committed rows so their KV stays in step */
+            int kd = 0;
+            for (int i = 0; i < k; i++) {
+                float p;
+                const int d = mtp_head(&M, i, dtok, ntk + i, base, true, &p);
+                if (p < (i ? mtp_gate : mtp_gate1)) {
+                    gated++;
+                    for (int j = i + 1; j < M.n_mtp; j++) mtp_head(&M, j, dtok, ntk, base, false, NULL);
+                    break;
+                }
+                dtok[ntk + kd++] = d;
+            }
+            k = kd;
+            npass_k[k]++;
             t_draft += now_s() - t0;
             const int *vt = dtok + ntk - 1;
             forward(&M, vt, k + 1, pos, k + 1);
@@ -1923,6 +1949,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ds4-mimo2: MTP drafting %.2fs (%.1f ms/pass), draft i kept in %ld/%ld/%ld passes\n",
                 t_draft, nfwd ? 1e3 * t_draft / nfwd : 0, acc_at[0], M2_MTP_MAX > 1 ? acc_at[1] : 0,
                 M2_MTP_MAX > 2 ? acc_at[2] : 0);
+    if (M.n_mtp)
+        fprintf(stderr, "ds4-mimo2: MTP gate %.2f (first %.2f): %ld chains cut, passes with 0/1/2/3 drafts %ld/%ld/%ld/%ld\n",
+                mtp_gate, mtp_gate1, gated, npass_k[0], npass_k[1], M2_MTP_MAX > 1 ? npass_k[2] : 0,
+                M2_MTP_MAX > 2 ? npass_k[3] : 0);
     print_stats(&M, "decode", &snap);
     if (prof_out) profile_save(&M, prof_out);
     return 0;
