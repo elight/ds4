@@ -644,7 +644,7 @@ typedef struct {
 
 /* ---- SSD reads: a small pool doing O_DIRECT preads ----------------------- */
 
-typedef struct { int fd; uint64_t off; size_t len; void *dst; } m2_io;
+typedef struct { int fd; uint64_t off; size_t len; void *dst; int *ctr; } m2_io;  /* ctr: parts in flight */
 
 typedef struct {
     pthread_mutex_t mu;
@@ -675,7 +675,9 @@ static void *io_main(void *arg) {
             done += (size_t)n;
         }
         pthread_mutex_lock(&p->mu);
-        if (--p->pending == 0) pthread_cond_broadcast(&p->cv_done);
+        if (r.ctr) --*r.ctr;
+        --p->pending;
+        pthread_cond_broadcast(&p->cv_done);
         pthread_mutex_unlock(&p->mu);
     }
 }
@@ -689,14 +691,31 @@ static void io_init(m2_iopool *p, int nth) {
     for (int i = 0; i < nth; i++) pthread_create(&p->th[i], NULL, io_main, p);
 }
 
-static void io_submit(m2_iopool *p, m2_io r) {
+/* urgent requests (a layer is waiting on them) jump ahead of lookahead reads */
+static void io_submit(m2_iopool *p, m2_io r, bool urgent) {
     pthread_mutex_lock(&p->mu);
     if (p->qhead == p->qn) p->qhead = p->qn = 0;
     if (p->qn == p->qcap) { p->qcap = p->qcap ? p->qcap * 2 : 1024; p->q = realloc(p->q, (size_t)p->qcap * sizeof(m2_io)); }
-    p->q[p->qn++] = r;
+    if (urgent && p->qhead > 0) p->q[--p->qhead] = r;
+    else if (urgent) { memmove(p->q + 1, p->q, (size_t)p->qn * sizeof(m2_io)); p->q[0] = r; p->qn++; }
+    else p->q[p->qn++] = r;
     p->pending++;
     pthread_cond_signal(&p->cv_work);
     pthread_mutex_unlock(&p->mu);
+}
+
+/* Waits until *ctr reaches zero (the reads of one RAM entry are done). */
+static void io_wait_ctr(m2_iopool *p, int *ctr) {
+    pthread_mutex_lock(&p->mu);
+    while (*ctr > 0) pthread_cond_wait(&p->cv_done, &p->mu);
+    pthread_mutex_unlock(&p->mu);
+}
+
+static int io_peek_ctr(m2_iopool *p, int *ctr) {
+    pthread_mutex_lock(&p->mu);
+    const int v = *ctr;
+    pthread_mutex_unlock(&p->mu);
+    return v;
 }
 
 static void io_wait(m2_iopool *p) {
@@ -724,7 +743,8 @@ typedef struct {
     uint64_t *ram_used;
 
     uint64_t tick;
-    uint64_t hit_vram, hit_ram, miss_ssd, ssd_bytes;
+    int *ram_pending;               /* parts still being read, guarded by the io mutex */
+    uint64_t hit_vram, hit_ram, miss_ssd, ssd_bytes, pf_reads, pf_hits;
     double t_ssd, t_wait;
     uint32_t count[M2_NEXP];        /* routing profile */
 } m2_tiers;
@@ -740,6 +760,8 @@ typedef struct {
     m2_tiers tr;
     m2_iopool io;
     /* device activations */
+    float *rlog_ahead, *h_rlog_ahead;
+    int lookahead;
     float *x, *xn, *qkv, *att, *tmp, *gt, *u, *h, *y, *rlog, *logits, *wts;
     int *assign;
     m2_moe_job *jobs;
@@ -873,6 +895,7 @@ static void alloc_runtime(m2_model *M) {
     M->h = M->gt;    /* MoE scratch reuses the dense-FFN buffers: [U*8][2048] fits [U][16384] */
     DALLOC(M->y, (size_t)U * M2_TOPK * M2_EMBD);
     DALLOC(M->rlog, (size_t)U * M2_NE);
+    DALLOC(M->rlog_ahead, (size_t)M2_NL * M2_NE);
     DALLOC(M->logits, (size_t)M->vb.n_vocab);
     DALLOC(M->wts, (size_t)U * M2_TOPK);
     DALLOC(M->assign, (size_t)U * M2_TOPK);
@@ -880,6 +903,7 @@ static void alloc_runtime(m2_model *M) {
 #undef DALLOC
     M->h_x = m2g_host_alloc((size_t)U * M2_EMBD * sizeof(float));
     M->h_rlog = m2g_host_alloc((size_t)U * M2_NE * sizeof(float));
+    M->h_rlog_ahead = m2g_host_alloc((size_t)M2_NL * M2_NE * sizeof(float));
     M->h_logits = m2g_host_alloc((size_t)M->vb.n_vocab * sizeof(float));
     M->h_wts = m2g_host_alloc((size_t)U * M2_TOPK * sizeof(float));
     M->h_assign = m2g_host_alloc((size_t)U * M2_TOPK * sizeof(int));
@@ -918,6 +942,7 @@ static void tiers_init(m2_model *M, double vram_reserve_gb, int max_slots, doubl
     T->nram = nr;
     T->ram_owner = xmalloc((size_t)nr * sizeof(int));
     T->ram_used = xcalloc((size_t)nr, sizeof(uint64_t));
+    T->ram_pending = xcalloc((size_t)nr, sizeof(int));
     for (int i = 0; i < nr; i++) T->ram_owner[i] = -1;
     fprintf(stderr, "ds4-mimo2: tiers: %d VRAM slots (%.1f GB), %d RAM entries (%.1f GB pinned in %.1fs), %d experts total\n",
             n, n * (double)M2_EXP_BYTES / 1e9, nr, nr * (double)T->ram_stride / 1e9, now_s() - t0, M2_NEXP);
@@ -945,13 +970,16 @@ static const uint8_t *ram_part(const m2_tiers *T, const m2_model *M, int r, int 
 }
 
 /* Queue the SSD reads that bring expert `id` into RAM entry r. */
-static void ram_fill(m2_model *M, int r, int id) {
+static void ram_fill(m2_model *M, int r, int id, bool urgent) {
     m2_tiers *T = &M->tr;
     const m2_layer *L = &M->L[id / M2_NE];
     const int e = id % M2_NE;
     const int fdd = M->g.fd_direct[L->exp_shard];
     const int fd = fdd >= 0 ? fdd : M->g.fd[L->exp_shard];
     size_t roff = 0;
+    pthread_mutex_lock(&M->io.mu);
+    T->ram_pending[r] = 3;
+    pthread_mutex_unlock(&M->io.mu);
     for (int part = 0; part < 3; part++) {
         const uint64_t off = part == 0 ? L->gate_off + (uint64_t)e * M2_GATE_BYTES
                            : part == 1 ? L->up_off + (uint64_t)e * M2_GATE_BYTES
@@ -959,7 +987,7 @@ static void ram_fill(m2_model *M, int r, int id) {
         const size_t bytes = part == 2 ? M2_DOWN_BYTES : M2_GATE_BYTES;
         const uint64_t a0 = off & ~(uint64_t)4095;
         const size_t len = align_up((size_t)(off - a0) + bytes, 4096);
-        io_submit(&M->io, (m2_io){ fd, a0, len, T->arena + (size_t)r * T->ram_stride + roff });
+        io_submit(&M->io, (m2_io){ fd, a0, len, T->arena + (size_t)r * T->ram_stride + roff, &T->ram_pending[r] }, urgent);
         T->ssd_bytes += len;
         roff += T->region[part];
     }
@@ -1002,23 +1030,30 @@ static void tiers_fetch(m2_model *M, const int *need, int n, int *slot_out) {
         const int r = T->ram_of[need[miss[k]]];
         if (r >= 0) T->ram_used[r] = T->tick;
     }
-    const double t0 = now_s();
     int nssd = 0;
     char *from_ssd = xcalloc((size_t)(nmiss ? nmiss : 1), 1);
     for (int k = 0; k < nmiss; k++) {
         const int id = need[miss[k]];
-        if (T->ram_of[id] >= 0) continue;
-        ram_fill(M, ram_claim(M, id), id);
+        const int r = T->ram_of[id];
+        if (r >= 0) {   /* resident, or still arriving from a lookahead read */
+            if (io_peek_ctr(&M->io, &T->ram_pending[r]) > 0) { from_ssd[k] = 1; T->pf_hits++; }
+            continue;
+        }
+        ram_fill(M, ram_claim(M, id), id, true);
         from_ssd[k] = 1;
         nssd++;
     }
     T->miss_ssd += (uint64_t)nssd;
     /* pass 0 copies RAM hits up while the SSD reads run; pass 1 the rest */
     for (int pass = 0; pass < 2; pass++) {
-        if (pass == 1 && nssd) { io_wait(&M->io); T->t_ssd += now_s() - t0; }
         for (int k = 0; k < nmiss; k++) {
             if (from_ssd[k] != pass) continue;
             const int i = miss[k], id = need[i];
+            if (pass == 1) {
+                const double tw = now_s();
+                io_wait_ctr(&M->io, &T->ram_pending[T->ram_of[id]]);
+                T->t_ssd += now_s() - tw;
+            }
             const int s = lru_pick(T->slot_used, T->nslots, T->tick);
         if (s < 0) die("VRAM slots exhausted within one layer");
         if (T->slot_owner[s] >= 0) T->slot_of[T->slot_owner[s]] = -1;
@@ -1074,6 +1109,32 @@ static void route(const float *logits, const float *bias, int *ids, float *w) {
     for (int k = 0; k < M2_TOPK; k++) w[k] /= s;
 }
 
+/* Decode lookahead: the next layers' routers applied to this layer's FFN input
+ * predict their experts well enough to start the SSD reads now, so they
+ * overlap the GPU work in between. Predictions only ever fill RAM. */
+static void prefetch_ahead(m2_model *M, int l) {
+    int nd = 0;
+    for (int d = 1; d <= M->lookahead && l + d < M2_NL; d++) {
+        GCK(m2g_matmul(M2_T_F32, M->L[l + d].router, M2_NE, M2_EMBD, M->xn, M2_EMBD,
+                       M->rlog_ahead + (size_t)(d - 1) * M2_NE, M2_NE, 1, 0));
+        nd++;
+    }
+    if (!nd) return;
+    GCK(m2g_download(M->h_rlog_ahead, M->rlog_ahead, (size_t)nd * M2_NE * sizeof(float)));
+    m2_tiers *T = &M->tr;
+    for (int d = 1; d <= nd; d++) {
+        int ids[M2_TOPK];
+        float w[M2_TOPK];
+        route(M->h_rlog_ahead + (size_t)(d - 1) * M2_NE, M->L[l + d].bias, ids, w);
+        for (int k = 0; k < M2_TOPK; k++) {
+            const int id = (l + d) * M2_NE + ids[k];
+            if (T->slot_of[id] >= 0 || T->ram_of[id] >= 0) continue;
+            ram_fill(M, ram_claim(M, id), id, false);
+            T->pf_reads++;
+        }
+    }
+}
+
 static void moe_layer(m2_model *M, int l, int n) {
     m2_layer *L = &M->L[l];
     GCK(m2g_matmul(M2_T_F32, L->router, M2_NE, M2_EMBD, M->xn, M2_EMBD, M->rlog, M2_NE, n, 0));
@@ -1088,6 +1149,7 @@ static void moe_layer(m2_model *M, int l, int n) {
     for (int e = 0; e < M2_NE; e++) if (cnt[e]) { expert_of_job[nj] = e; need[nj] = l * M2_NE + e; nj++; }
     int slot[M2_NE];
     for (int j = 0; j < nj; j++) slot[j] = -1;
+    if (n == 1 && M->lookahead > 0) prefetch_ahead(M, l);
     tiers_fetch(M, need, nj, slot);
     int job_of_e[M2_NE], fill[M2_NE];
     int off = 0;
@@ -1191,7 +1253,7 @@ static void profile_seed(m2_model *M, const char *path) {
     for (int i0 = 0; i0 < nram; i0 += batch) {
         T->tick++;
         const int i1 = i0 + batch < nram ? i0 + batch : nram;
-        for (int i = i0; i < i1; i++) ram_fill(M, ram_claim(M, rk[i].id), rk[i].id);
+        for (int i = i0; i < i1; i++) ram_fill(M, ram_claim(M, rk[i].id), rk[i].id, false);
         io_wait(&M->io);
         for (int i = i0; i < i1; i++) {
             if (i >= T->nslots) break;
@@ -1236,6 +1298,7 @@ static void usage(void) {
         "  --tokens           print token ids of the prompt and exit\n"
         "  --top-logits K     print the top K logits after the prompt\n"
         "  --io-threads N     SSD reader threads (default 8)\n"
+        "  --lookahead N      decode: prefetch predicted experts N layers ahead (default 2, 0 off)\n"
         "  -v                 verbose\n");
     exit(2);
 }
@@ -1265,12 +1328,15 @@ static void print_stats(const m2_model *M, const char *what, const m2_tiers *bef
     fprintf(stderr, "ds4-mimo2: %s experts: %llu lookups, VRAM %.1f%%, RAM %.1f%%, SSD %.1f%% (%.2f GB read)\n",
             what, (unsigned long long)tot, tot ? 100.0 * hv / tot : 0, tot ? 100.0 * hr / tot : 0,
             tot ? 100.0 * ms / tot : 0, (T->ssd_bytes - before->ssd_bytes) / 1e9);
+    if (T->pf_reads > before->pf_reads)
+        fprintf(stderr, "ds4-mimo2: %s lookahead: %llu reads issued, %llu caught still in flight\n", what,
+                (unsigned long long)(T->pf_reads - before->pf_reads), (unsigned long long)(T->pf_hits - before->pf_hits));
 }
 
 int main(int argc, char **argv) {
     const char *model = NULL, *prompt = NULL, *pfile = NULL, *prof = NULL, *prof_out = NULL;
     int n_gen = 128, ctx = 8192, ubatch = 1024, raw = 0, think = 0, slots = -1, seed = 1, bench = 0;
-    int show_tokens = 0, top_logits = 0, io_threads = 8, verbose = 0;
+    int show_tokens = 0, top_logits = 0, io_threads = 8, verbose = 0, lookahead = 2;
     double ram_gb = -1, reserve = 0.6;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -1293,6 +1359,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--tokens")) show_tokens = 1;
         else if (!strcmp(a, "--top-logits")) top_logits = atoi(NEXT());
         else if (!strcmp(a, "--io-threads")) io_threads = atoi(NEXT());
+        else if (!strcmp(a, "--lookahead")) lookahead = atoi(NEXT());
         else if (!strcmp(a, "-v")) verbose = 1;
         else usage();
 #undef NEXT
@@ -1304,6 +1371,7 @@ int main(int argc, char **argv) {
     M.ctx = ctx;
     M.ubatch = ubatch;
     M.verbose = verbose;
+    M.lookahead = lookahead;
     double t0 = now_s();
     model_load(&M, model, show_tokens);
 
