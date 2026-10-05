@@ -74142,10 +74142,42 @@ static void qwen4_spec_note_first_draft(ds4_session *s, bool accepted_first) {
  * it is the target argmax; exact sampling treats it as a point-mass proposal
  * (accept with p(draft), else replay a residual sample) and always runs at
  * depth 2. */
+/* DS4_QWEN4_SPEC_TIMING=1: wall time per MTP cycle, split into the verify
+ * forward and everything else (drafting, restores), every 64 cycles. */
+static struct { int on; uint64_t cycles, tokens; double total, verify; } g_qwen4_spec_timing = { -1 };
+
+static int ds4_session_qwen4_spec_cycle_impl(ds4_session *s, int first_token, float temperature, int top_k,
+                                             float top_p, float min_p, uint64_t *rng, bool exact_sampling,
+                                             int *accepted, int accepted_cap,
+                                             char *err, size_t errlen);
+
 static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float temperature, int top_k,
                                         float top_p, float min_p, uint64_t *rng, bool exact_sampling,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
+    if (g_qwen4_spec_timing.on < 0) g_qwen4_spec_timing.on = getenv("DS4_QWEN4_SPEC_TIMING") != NULL;
+    if (!g_qwen4_spec_timing.on)
+        return ds4_session_qwen4_spec_cycle_impl(s, first_token, temperature, top_k, top_p, min_p, rng,
+                                                 exact_sampling, accepted, accepted_cap, err, errlen);
+    const double t0 = now_sec();
+    const int n = ds4_session_qwen4_spec_cycle_impl(s, first_token, temperature, top_k, top_p, min_p, rng,
+                                                    exact_sampling, accepted, accepted_cap, err, errlen);
+    g_qwen4_spec_timing.total += now_sec() - t0;
+    g_qwen4_spec_timing.tokens += n > 0 ? (uint64_t)n : 0u;
+    if (++g_qwen4_spec_timing.cycles % 64u == 0) {
+        const double c = (double)g_qwen4_spec_timing.cycles;
+        fprintf(stderr, "ds4: MTP cycles %llu: %.2f tokens/cycle, %.2f ms/cycle (verify %.2f, rest %.2f)\n",
+                (unsigned long long)g_qwen4_spec_timing.cycles, (double)g_qwen4_spec_timing.tokens / c,
+                g_qwen4_spec_timing.total * 1e3 / c, g_qwen4_spec_timing.verify * 1e3 / c,
+                (g_qwen4_spec_timing.total - g_qwen4_spec_timing.verify) * 1e3 / c);
+    }
+    return n;
+}
+
+static int ds4_session_qwen4_spec_cycle_impl(ds4_session *s, int first_token, float temperature, int top_k,
+                                             float top_p, float min_p, uint64_t *rng, bool exact_sampling,
+                                             int *accepted, int accepted_cap,
+                                             char *err, size_t errlen) {
     ds4_engine *e = s->engine;
     ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
     const ds4_model *m = &e->model;
@@ -74218,7 +74250,9 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     g->snap2_valid = false;
     g->verify_rows_exact = deep;
     ds4_gpu_qwen4_set_verify_rows_exact(deep);
+    const double verify_t0 = g_qwen4_spec_timing.on > 0 ? now_sec() : 0.0;
     const bool ok = qwen4_graph_forward_tokens(g, m, w, toks, T, rows, true);
+    if (g_qwen4_spec_timing.on > 0) g_qwen4_spec_timing.verify += now_sec() - verify_t0;
     ds4_gpu_qwen4_set_verify_rows_exact(false);
     g->verify_rows_exact = false;
     g->snap_after_second = false;

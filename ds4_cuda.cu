@@ -34524,12 +34524,58 @@ extern "C" int ds4_gpu_qwen4_cpu_hybrid_finish(ds4_gpu_tensor *part, uint32_t st
     return cuda_ok(cudaGetLastError(), "hybrid scatter");
 }
 
+/* A routed layer whose experts are a different size from the slab class (the
+ * MTP layer of Qwen3.8 Q2 is Q4 among IQ2 layers) cannot share the slot cache:
+ * each switch would free and refill it. Such a layer is held whole in VRAM,
+ * copied once from the RAM tier, and indexed by its own expert ids. Returns
+ * -1 when the layer is not off-class or the RAM tier does not hold it. */
+static std::unordered_map<uint64_t, char *> g_qwen4_offclass;
+
+static int cuda_qwen4_offclass_route(const ds4_gpu_stream_expert_table *table, uint32_t *n_expert_out) {
+    const uint64_t gb = table->gate_expert_bytes, db = table->down_expert_bytes, n = table->n_total_expert;
+    if (!g_stream_expert_bytes || 2u * gb + db == g_stream_expert_bytes || !n) return -1;
+    char *base = NULL;
+    const auto found = g_qwen4_offclass.find(table->gate_offset);
+    if (found != g_qwen4_offclass.end()) {
+        base = found->second;
+    } else {
+        const char *g0, *u0, *d0, *gl, *ul, *dl;
+        if (!cuda_ram_tier_lookup(table, 0, &g0, &u0, &d0) ||
+            !cuda_ram_tier_lookup(table, n - 1, &gl, &ul, &dl)) return -1;
+        /* The slot cache sized itself from free VRAM; drop it once so it
+         * re-sizes around this layer instead of eating its headroom. */
+        cuda_stream_selected_cache_release();
+        if (!cuda_ok(cudaMalloc((void **)&base, n * (2u * gb + db)), "off-class expert layer")) return 0;
+        cudaStream_t s = cuda_decode_stream();
+        if (!cuda_ok(cudaMemcpyAsync(base, g0, n * gb, cudaMemcpyHostToDevice, s), "off-class gate") ||
+            !cuda_ok(cudaMemcpyAsync(base + n * gb, u0, n * gb, cudaMemcpyHostToDevice, s), "off-class up") ||
+            !cuda_ok(cudaMemcpyAsync(base + 2u * n * gb, d0, n * db, cudaMemcpyHostToDevice, s), "off-class down"))
+            return 0;
+        g_qwen4_offclass[table->gate_offset] = base;
+        fprintf(stderr, "ds4: CUDA expert layer off the slab class held whole in VRAM: %llu experts, %.2f GiB\n",
+                (unsigned long long)n, (double)(n * (2u * gb + db)) / 1073741824.0);
+    }
+    auto &r = g_qwen4_stream_redirect;
+    r.gate_offset = table->gate_offset;
+    r.up_offset = table->up_offset;
+    r.down_offset = table->down_offset;
+    r.gate = base; r.up = base + n * gb; r.down = base + 2u * n * gb;
+    r.valid = 1;
+    *n_expert_out = (uint32_t)n;
+    return 1;
+}
+
 extern "C" int ds4_gpu_qwen4_stream_route(const ds4_gpu_stream_expert_table *table,
         ds4_gpu_tensor *selected, uint32_t n_selected, int compact, uint32_t *n_expert_out) {
     g_qwen4_stream_redirect.valid = 0;
     if (!g_ssd_streaming_mode) return 1;
     if (!table || !selected || !n_selected || !n_expert_out ||
         selected->bytes < (uint64_t)n_selected * sizeof(int32_t)) return 0;
+    const int off = cuda_qwen4_offclass_route(table, n_expert_out);
+    if (off >= 0) {
+        g_hybrid.armed = false;
+        return off;
+    }
     std::vector<int32_t> ids;
     try { ids.resize(n_selected); } catch (...) { return 0; }
     if (!cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "Qwen route wait") ||
