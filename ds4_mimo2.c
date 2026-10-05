@@ -770,6 +770,7 @@ typedef struct {
     int cpu_experts;    /* decode: RAM-tier experts computed on the CPU in place */
     int cpu_pcie;       /* ...except this many per layer, still copied up to VRAM */
     ds4_cpu_expert_job cpu_jobs[M2_TOPK];
+    float cpu_w[M2_TOPK];
     float *h_xn, *cpu_out, *h_cpu_y;
     float *x, *xn, *qkv, *att, *tmp, *gt, *u, *h, *y, *rlog, *logits, *wts;
     int *assign;
@@ -1245,11 +1246,17 @@ static int moe_cpu_split(const m2_model *M, int *need, int *expert_of_job, int n
 
 /* Queues jobs [ngpu, nj) on the CPU pool; returns how many. The RAM entries
  * are marked used for the tick tiers_fetch is about to start, so nothing it
- * reads or demotes this layer can land on them. */
-static int moe_cpu_submit(m2_model *M, const int *need, int ngpu, int nj) {
+ * reads or demotes this layer can land on them. Each CPU expert's router
+ * weight moves to cpu_w and is zeroed in h_wts, so the GPU's combine, which
+ * walks all top-k slots, skips it. */
+static int moe_cpu_submit(m2_model *M, const int *need, const int *expert_of_job, const int *ids,
+                          int ngpu, int nj) {
     const int nc = nj - ngpu;
     if (!nc) return 0;
     m2_tiers *T = &M->tr;
+    for (int c = 0; c < nc; c++)
+        for (int k = 0; k < M2_TOPK; k++)
+            if (ids[k] == expert_of_job[ngpu + c]) { M->cpu_w[c] = M->h_wts[k]; M->h_wts[k] = 0.f; }
     GCK(m2g_download(M->h_xn, M->xn, M2_EMBD * sizeof(float)));
     for (int c = 0; c < nc; c++) {
         const int id = need[ngpu + c], r = T->ram_of[id];
@@ -1267,15 +1274,13 @@ static int moe_cpu_submit(m2_model *M, const int *need, int ngpu, int nj) {
 
 /* Waits for the CPU's experts and adds their weighted sum into the residual
  * after the GPU's share, on the same stream. */
-static void moe_cpu_finish(m2_model *M, const int *expert_of_job, int ngpu, int nc, const int *ids) {
+static void moe_cpu_finish(m2_model *M, int nc) {
     if (!nc) return;
     M->tr.t_cpu_wait += ds4_cpu_experts_wait();
     float *y = M->h_cpu_y;
     memset(y, 0, M2_EMBD * sizeof(float));
     for (int c = 0; c < nc; c++) {
-        const int e = expert_of_job[ngpu + c];
-        float w = 0.f;
-        for (int k = 0; k < M2_TOPK; k++) if (ids[k] == e) w = M->h_wts[k];
+        const float w = M->cpu_w[c];
         const float *o = M->cpu_out + (size_t)c * M2_EMBD;
         for (int i = 0; i < M2_EMBD; i++) y[i] += w * o[i];
     }
@@ -1301,7 +1306,7 @@ static void moe_layer(m2_model *M, int l, int n) {
     uint8_t where[M2_NE];
     tiers_where(M, need, nj, where);
     const int ngpu = moe_cpu_split(M, need, expert_of_job, nj, where, n);
-    const int nc = moe_cpu_submit(M, need, ngpu, nj);
+    const int nc = moe_cpu_submit(M, need, expert_of_job, ids, ngpu, nj);
     tiers_fetch(M, need, ngpu, slot, n >= M2_STREAM_MIN);
     int job_of_e[M2_NE], fill[M2_NE];
     for (int e = 0; e < M2_NE; e++) job_of_e[e] = -1;
@@ -1325,7 +1330,7 @@ static void moe_layer(m2_model *M, int l, int n) {
         GCK(m2g_moe(M->jobs, ngpu, M->assign, M->wts, n, M2_TOPK, M->xn, M->h, M->y, M->x,
                     M2_EMBD, M2_FF_EXP, M2_GATE_BYTES, M2_GATE_BYTES));
     }
-    moe_cpu_finish(M, expert_of_job, ngpu, nc, ids);
+    moe_cpu_finish(M, nc);
     /* the pinned staging is reused next layer; the download there orders it */
 }
 

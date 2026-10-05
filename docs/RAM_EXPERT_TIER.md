@@ -72,6 +72,9 @@ VRAM hit rate, RAM hit rate, SSD bytes per token. Results go in the table below.
 | 2026-10-05 | MiMo V2.6 Flash Q2_K | 6, ctx 8192, ubatch 2304 | 2.52 | 27.25 | 62.0% | one prefill pass reads 65 GB from SSD instead of 164 GB; costs 84 VRAM slots |
 | 2026-10-05 | MiMo V2.6 Flash Q2_K | 6, ctx 8192, 44 GB RAM | 2.87 | 20.66 | 63.1% | `--ram-gb 44`, ubatch 1024 |
 | 2026-10-05 | MiMo V2.6 Flash Q2_K | llama.cpp, ctx 8192 | 3.66 | 17.59 | — | same 2204-token prompt, `-b 1024 -ub 1024` |
+| 2026-10-05 | MiMo V2.6 Flash Q2_K | 4+6: RAM tier on CPU | 4.75 | — | 32.6% | story run; 59.5% of decode lookups computed on the CPU in place, SSD 7.9% |
+| 2026-10-05 | MiMo V2.6 Flash Q2_K | 6, same window | 3.65 | — | 65.8% | `--cpu-experts 0`, back to back with the row above |
+| 2026-10-05 | MiMo V2.6 Flash Q2_K | llama.cpp, same window | 5.04 | — | — | story run; faster than the 4.08 row, likely a warmer page cache |
 
 RTX 3090, PCIe gen3, ctx 8192, 128 generated tokens, 5575 VRAM slots (7.7 GiB).
 Command: `ds4-bench -m Qwen3.8-Flash-Next-Q2.gguf --cuda --ssd-streaming
@@ -105,5 +108,15 @@ How the tiers behave:
 
 Where decode time goes on the 2204-token run, ~380 ms/token: ~180 ms waiting
 on the SSD (16% of experts), ~65 ms copying RAM-tier experts over PCIe, the
-rest compute. The CPU-computes-RAM-experts split (branch `cpu-hybrid`) plugs in
-at `moe_cpu_split()`, which already receives each job's tier.
+rest compute.
+
+**RAM-tier experts run on the CPU in decode** (`--cpu-experts 1`, the
+default). `moe_cpu_split()` hands experts already resident in RAM to the CPU
+expert pool, which reads them in place while the GPU runs its VRAM hits and
+waits on SSD misses; `--cpu-pcie N` keeps N per layer on the copy path. The
+down projection is MXFP4, so the pool has an MXFP4 x Q8_K AVX2 dot for it
+(`tests/test_cpu_experts.c`). Parity: teacher-forcing llama.cpp's story one
+token per step (`misc/llmbox/mimo2-score-decode.sh`) gives ppl 1.799 and 95.5%
+top-1 agreement with the split, 1.802 and 95.5% without. Story decode goes
+3.65 → 4.75 t/s; the host never waits on the CPU (0.09 s per run), so the
+SSD (14.5 s of the 33.5 s) is what is left.

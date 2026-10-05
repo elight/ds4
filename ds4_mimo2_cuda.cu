@@ -588,7 +588,10 @@ __global__ void k_moe_combine(const float *Y, const float *wts, float *out, int 
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_embd) return;
     float s = 0.f;
-    for (int k = 0; k < topk; k++) s += wts[t * topk + k] * Y[((size_t)t * topk + k) * n_embd + i];
+    for (int k = 0; k < topk; k++) {   /* weight 0: computed elsewhere (CPU), Y row is stale */
+        const float w = wts[t * topk + k];
+        if (w != 0.f) s += w * Y[((size_t)t * topk + k) * n_embd + i];
+    }
     out[(size_t)t * n_embd + i] += s;
 }
 
