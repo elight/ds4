@@ -63,3 +63,15 @@ VRAM hit rate, RAM hit rate, SSD bytes per token. Results go in the table below.
 
 | Date | Model | Phase | Decode t/s | Prefill t/s | VRAM hit | Notes |
 |---|---|---|---:|---:|---:|---|
+| 2026-10-05 | Qwen3.8 Q2 | 1: VRAM slots + SSD | 6.57 | 315.30 | 46.3% | `--ram-expert-cache 0`; 62.8 GiB read from SSD at 2.0 GB/s |
+| 2026-10-05 | Qwen3.8 Q2 | 2: + pinned RAM tier | 29.34 | 717.35 | 59.2% | all 35.4 GiB of experts in RAM (16 s O_DIRECT fill); RAM→VRAM at 10.9 GB/s; no SSD reads |
+
+RTX 3090, PCIe gen3, ctx 8192, 128 generated tokens, 5575 VRAM slots (7.7 GiB).
+Command: `ds4-bench -m Qwen3.8-Flash-Next-Q2.gguf --cuda --ssd-streaming
+--prompt-file tests/long_context_story_prompt.txt --ctx-start 8192 --ctx-max 8192
+--gen-tokens 128`, plus `--ram-expert-cache 0` for the phase 1 row.
+
+The 147 GB Qwen file is mostly a 95 GiB BF16 n-gram table that stays on disk;
+the routed experts are 35.4 GiB and the rest of the weights are 6.3 GiB in VRAM.
+Correctness: prompt logits from a 256-slot SSD-only cache and from the full
+RAM tier are bit-identical.
