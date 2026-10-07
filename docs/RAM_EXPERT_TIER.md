@@ -74,6 +74,19 @@ VRAM hit rate, RAM hit rate, SSD bytes per token. Results go in the table below.
 | 2026-10-05 | MiMo V2.6 Flash Q2_K | llama.cpp, ctx 8192 | 3.66 | 17.59 | — | same 2204-token prompt, `-b 1024 -ub 1024` |
 | 2026-10-05 | MiMo V2.6 Flash Q2_K | 4+6: RAM tier on CPU | 4.75 | — | 32.6% | story run; 59.5% of decode lookups computed on the CPU in place, SSD 7.9% |
 | 2026-10-05 | MiMo V2.6 Flash Q2_K | 6, same window | 3.65 | — | 65.8% | `--cpu-experts 0`, back to back with the row above |
+| 2026-10-07 | MiMo V2.6 Flash Q2_K | baseline, `--cpu-experts 1` | 5.18 | 2.59 | 41.5% | `mimo-bench.sh baseline` story step; 159 decoded, SSD wait 13.03 s of 30.69 s, 51.5% of lookups on the CPU |
+| 2026-10-07 | MiMo V2.6 Flash Q2_K | baseline, `--cpu-experts 0` | 3.66 | 2.59 | 65.8% | same window, 154 decoded, SSD wait 12.19 s of 41.99 s |
+| 2026-10-07 | MiMo V2.6 Flash Q2_K | llama.cpp, story | 4.70 | 1.67 | — | same story prompt, `-ngl 99 -ot exps=CPU -c 4096 -t 10` |
+| 2026-10-07 | MiMo V2.6 Flash Q2_K | baseline, 2203-token prompt | 3.25 | 17.89 | 36.0% | ctx 8192 ubatch 1024, `--cpu-experts 1`; prefill reads 65.5% of experts from SSD |
+| 2026-10-07 | MiMo V2.6 Flash Q2_K | llama.cpp, 2203-token prompt | 3.87 | 17.54 | — | same prompt, `-b 1024 -ub 1024` |
+
+The 2026-10-07 rows come from `misc/llmbox/mimo-bench.sh baseline`, whose
+records are in `~/claude-tmp/mimo-bench/baseline/results.jsonl`. The prompt is a
+2203-token cut of llama.cpp `docs/build.md` measured with `llama-tokenize`, so
+the llama.cpp and ds4 rows score the same tokens. Two things the earlier rows
+left open: decode on the long prompt is behind llama.cpp (3.25 against 3.87)
+while prefill is level, and the story run's 13 s of SSD wait is 42% of the
+time in the window.
 | 2026-10-05 | MiMo V2.6 Flash Q2_K | llama.cpp, same window | 5.04 | — | — | story run; faster than the 4.08 row, likely a warmer page cache |
 | 2026-10-05 | MiMo V2.6 Flash Q2_K | 4+6, MTP 3 drafts | 3.24 | — | — | 96-token story; 34% kept, 2.02 tokens/pass; a 4-token pass reads about 2.7x the experts of a one-token step |
 | 2026-10-05 | MiMo V2.6 Flash Q2_K | 4+6, `--slots 1650` | 4.84 | — | — | 96-token story, MTP off; the rows below are the same window and slot count |
