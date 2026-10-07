@@ -93,6 +93,38 @@ AVX2 kernel takes over from the CUDA kernel is a chance for a near-tie to flip.
 The GPU-only path sits at 91.7% and does not move, so the 95.5% figure was a
 property of the CPU split at one particular arena size, not of the engine.
 
+### MTP is a net loss at every arena size, and the reason is structural
+
+Same greedy story, four draft settings, CPU split on and off, at the 45 GB default:
+
+| run | decode t/s | SSD wait | accepted | tokens/pass |
+|---|---:|---:|---:|---:|
+| `--cpu-experts 1` plain | 5.68 | 8.72 s | — | — |
+| mtp1 | 5.56 | 9.44 s | 64.9% | 1.65 |
+| mtp3 | 4.21 | 13.14 s | 34.4% | 2.03 |
+| mtp3g70 | 5.65 | 9.50 s | 68.6% | 1.87 |
+| `--cpu-experts 0` plain | 3.73 | 8.85 s | — | — |
+| mtp1 | 3.69 | 9.18 s | 73.0% | 1.73 |
+| mtp3 | 2.59 | 12.48 s | 39.0% | 2.17 |
+| mtp3g70 | 3.56 | 9.61 s | 75.6% | 1.95 |
+
+No draft setting beats plain decode. Drafting 3 tokens earns 1.87-2.03 tokens per
+verify pass, and pays for it in expert reads: a verify batch of k+1 tokens touches
+the union of k+1 tokens' experts, so mtp3's SSD wait is 13.14 s against plain's
+8.72 s. On a box where decode is bound by expert reads, speculative work is
+speculative *reading*, which is the expensive part. The confidence gate recovers
+most of the loss (mtp3g70 5.65 against plain 5.68) and lands inside noise, and it
+does so by cutting chains, which is the same as drafting less.
+
+The gate also breaks the parity requirement: `mtp3g70` with the CPU split on
+diverges from plain greedy at character 42, because the gate is a probability
+threshold on a head, not a condition on the trunk. With the CPU split off the same
+setting reproduces plain greedy exactly.
+
+MTP stays off by default. Making it pay needs drafts that do not multiply expert
+reads, which on this architecture means drafting against a resident expert set,
+not a better gate.
+
 The speed cost of giving the parity back is the whole win: `--cpu-experts 0` at
 the new tier decodes at 3.84 t/s against 6.11. Closing it needs the two kernels
 to agree bit for bit, which is the `DS4_CPU_HYBRID_EXACT` line of work on the
