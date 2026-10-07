@@ -728,7 +728,7 @@ static void io_wait(m2_iopool *p) {
 /* ---- expert tiers -------------------------------------------------------- */
 
 #define M2_NEXP (M2_NL * M2_NE)
-#define M2_STREAM_MIN 256         /* batch size from which a layer streams its misses */
+#define M2_STREAM_MIN 256         /* batch size from which a layer streams its misses; see the note in docs/RAM_EXPERT_TIER.md */
 #define M2_CPU_NMAX 8             /* batches up to this size share their experts with the CPU */
 #define M2_MTP_MAX 3              /* MTP heads, so drafts per step */
 

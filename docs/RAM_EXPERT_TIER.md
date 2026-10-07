@@ -101,6 +101,15 @@ already places about as well as a static ranking. And the CPU expert split does
 not collapse the VRAM hit rate — 41.5% against 65.8% is the split working as
 designed, because a RAM-tier expert computed on the CPU is never promoted into a
 VRAM slot, and the run is 42% faster for it.
+
+`M2_STREAM_MIN` was tried at 32 and put back at 256. A 34-token prefill does not
+stream at 256, and making it stream is much better for the prefill and worse for
+the decode that follows it: prefill 3.89 t/s against 2.59, SSD share 49.5%
+against 59.9%, 21.5 GB read against 26.0 GB — and decode 5.25 t/s against 5.98,
+with the decode SSD share up from 5.3% to 7.1%. Streaming marks the slots it
+used evict-first and never caches them, so decode starts on a cache that holds
+none of the experts the prompt touched. Decode is the number the box is judged
+on, so the threshold stays where a 34-token batch caches what it read.
 | 2026-10-07 | MiMo V2.6 Flash Q2_K | baseline, 2203-token prompt | 3.25 | 17.89 | 36.0% | ctx 8192 ubatch 1024, `--cpu-experts 1`; prefill reads 65.5% of experts from SSD |
 | 2026-10-07 | MiMo V2.6 Flash Q2_K | llama.cpp, 2203-token prompt | 3.87 | 17.54 | — | same prompt, `-b 1024 -ub 1024` |
 
