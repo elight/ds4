@@ -7,7 +7,8 @@
 # llama.cpp's.
 set -u
 OUT=${1:?usage: $0 OUTDIR}
-mkdir -p "$OUT"
+mkdir -p "$OUT" || exit 2
+[ -d "$OUT" ] || { echo "mimo2-story: cannot write $OUT" >&2; exit 2; }
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 M=/srv/models/gguf/mimo/MiMo-V2.6-Flash-RL-Q2_K-00001-of-00002.gguf
 LLAMA=/home/evan/src/llama.cpp/build/bin/llama-completion
