@@ -80,6 +80,23 @@ VRAM hit rate, RAM hit rate, SSD bytes per token. Results go in the table below.
 | 2026-10-07 | MiMo V2.6 Flash Q2_K | RAM tier 44 GB | 5.91 | — | 39.9% | story, `--ram-gb 44`; SSD wait 9.89 s of 26.91 s, SSD share 5.4% |
 | 2026-10-07 | MiMo V2.6 Flash Q2_K | RAM tier 52 GB | 6.30 | — | 40.2% | story, `--ram-gb 52`; SSD wait 8.38 s of 25.25 s, SSD share 4.5% |
 | 2026-10-07 | MiMo V2.6 Flash Q2_K | RAM tier default (45.2 GB pinned) | 5.98 | — | 40.3% | story, no `--ram-gb`; SSD wait 9.31 s of 25.42 s, SSD share 5.3%, against 13.01 s and 7.1% at the old 36 GB cap |
+| 2026-10-07 | MiMo V2.6 Flash Q2_K | default tier, full queue | 6.11 | 2.96 | 40.7% | `mimo-bench.sh baseline` with the final build: 157 decoded, SSD wait 9.33 s, 54.2% of lookups on the CPU; llama.cpp in the same queue 4.78 decode, 1.70 prefill |
+| 2026-10-07 | MiMo V2.6 Flash Q2_K | default tier, 2203-token prompt | 3.83 | 19.12 | 32.5% | ctx 8192 ubatch 1024; llama.cpp 3.83 decode, 17.60 prefill |
+
+### The CPU expert kernel costs parity, and the arena makes it worse
+
+Teacher-forcing llama.cpp's own story (`--score-from 34 --ubatch 1`), top-1
+agreement with llama.cpp: 95.5% at the 36 GB tier with `--cpu-experts 1`, 92.3%
+at the 45 GB default, and 91.7% with `--cpu-experts 0` at both. The CPU share of
+decode lookups rose from 51.5% to 54.2% as the arena grew, and every expert the
+AVX2 kernel takes over from the CUDA kernel is a chance for a near-tie to flip.
+The GPU-only path sits at 91.7% and does not move, so the 95.5% figure was a
+property of the CPU split at one particular arena size, not of the engine.
+
+The speed cost of giving the parity back is the whole win: `--cpu-experts 0` at
+the new tier decodes at 3.84 t/s against 6.11. Closing it needs the two kernels
+to agree bit for bit, which is the `DS4_CPU_HYBRID_EXACT` line of work on the
+`cpu-hybrid` branch, not a knob.
 
 ### Where a MiMo decode token goes
 
