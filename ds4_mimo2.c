@@ -1646,6 +1646,10 @@ static void usage(void) {
         "  --mtp FILE         decode with MTP: draft with the nextn heads in FILE, verify in one batch\n"
         "  --mtp-draft N      drafts per step, 1-3 (default 1)\n"
         "  --mtp-gate P       stop drafting when a head's top probability is below P\n"
+        "  --temp T           sample at temperature T (0 = greedy, the measured path)\n"
+        "  --top-k N          sample only over the N largest logits\n"
+        "  --top-p P          cut the top-k tail at cumulative mass P (needs --top-k)\n"
+        "  --rng-seed N       sampling RNG seed; printed so the run can be repeated\n"
         "                     (default 0; the first draft is always kept)\n"
         "  --mtp-gate-first P gate the first draft too (default 0)\n"
         "  -v                 verbose\n");
@@ -1667,6 +1671,103 @@ static int argmax(const float *v, int n) {
     int b = 0;
     for (int i = 1; i < n; i++) if (v[i] > v[b]) b = i;
     return b;
+}
+
+/* ---- sampling ------------------------------------------------------------ */
+/* xorshift64*, so a run is reproducible from a printed seed: the only way a
+ * sampling change can be checked against itself. */
+static uint64_t rng_next(uint64_t *s) {
+    *s ^= *s >> 12; *s ^= *s << 25; *s ^= *s >> 27;
+    return *s * 2685821657736338717ULL;
+}
+
+static double rng_unit(uint64_t *s) { return (double)(rng_next(s) >> 11) / 9007199254740992.0; }
+
+/* Pick a token from a head's logits. temp <= 0 is the argmax, so a run with no
+ * sampling flags is exactly the run the speed numbers were taken on.
+ *
+ * top-k keeps the k largest logits in a min-heap and takes its exponentials
+ * over those k, which is what makes sampling cheap on a 128k vocabulary.
+ * top-p cuts the tail of that kept set, so it is only meaningful together with
+ * top-k: over the whole vocabulary a cumulative-mass cut needs the vocabulary
+ * sorted, and that is the one thing this engine does not do. */
+#define M2_TOP_MAX 512
+
+static int m2_sample(const float *lg, int n, float temp, int top_k, float top_p, uint64_t *rng) {
+    if (temp <= 0.f) return argmax(lg, n);
+    int v_of[M2_TOP_MAX];
+    double p[M2_TOP_MAX];
+    float l_of[M2_TOP_MAX];
+    const int cap = top_k > 0 ? (top_k > M2_TOP_MAX ? M2_TOP_MAX : top_k) : 0;
+    int nh = 0;
+    if (cap) {
+        /* min-heap on l_of: the root is the smallest kept logit, so a new
+         * candidate either replaces it or sifts down from there */
+        for (int v = 0; v < n; v++) {
+            const float l = lg[v];
+            if (nh < cap) {
+                int i = nh++;
+                while (i > 0 && l_of[(i - 1) >> 1] > l) {
+                    l_of[i] = l_of[(i - 1) >> 1]; v_of[i] = v_of[(i - 1) >> 1];
+                    i = (i - 1) >> 1;
+                }
+                l_of[i] = l; v_of[i] = v;
+            } else if (l > l_of[0]) {
+                int i = 0;
+                for (;;) {
+                    int c = 2 * i + 1;
+                    if (c >= nh) break;
+                    if (c + 1 < nh && l_of[c + 1] < l_of[c]) c++;
+                    if (l_of[c] >= l) break;
+                    l_of[i] = l_of[c]; v_of[i] = v_of[c];
+                    i = c;
+                }
+                l_of[i] = l; v_of[i] = v;
+            }
+        }
+        float mx = l_of[0];
+        for (int i = 1; i < nh; i++) if (l_of[i] > mx) mx = l_of[i];
+        double total = 0;
+        for (int i = 0; i < nh; i++) { p[i] = exp((double)(l_of[i] - mx) / temp); total += p[i]; }
+        if (top_p > 0.f && top_p < 1.f) {   /* drop the kept set's tail by mass */
+            for (int a = 0; a < nh; a++) {
+                int b = a;
+                for (int i = a + 1; i < nh; i++) if (p[i] > p[b]) b = i;
+                double td = p[a]; p[a] = p[b]; p[b] = td;
+                float tl = l_of[a]; l_of[a] = l_of[b]; l_of[b] = tl;
+                int tv = v_of[a]; v_of[a] = v_of[b]; v_of[b] = tv;
+            }
+            double acc = 0, keep = top_p * total;
+            int cut = nh;
+            for (int i = 0; i < nh; i++) { acc += p[i]; if (acc >= keep) { cut = i + 1; break; } }
+            total = 0;
+            for (int i = 0; i < cut; i++) total += p[i];
+            nh = cut;
+        }
+        const double u = rng_unit(rng) * total;
+        double acc = 0;
+        for (int i = 0; i < nh; i++) { acc += p[i]; if (u <= acc) return v_of[i]; }
+        return v_of[nh - 1];
+    }
+    const int mx = argmax(lg, n);
+    double total = 0;
+    for (int v = 0; v < n; v++) total += exp((double)(lg[v] - lg[mx]) / temp);
+    const double u = rng_unit(rng) * total;
+    double acc = 0;
+    for (int v = 0; v < n; v++) {
+        acc += exp((double)(lg[v] - lg[mx]) / temp);
+        if (u <= acc) return v;
+    }
+    return mx;
+}
+
+/* The decode loops pick through this so the call sites stay one expression. */
+static float s_temp, s_top_p;
+static int s_top_k;
+static uint64_t s_rng;
+
+static int pick_tok(const float *lg, int n) {
+    return m2_sample(lg, n, s_temp, s_top_k, s_top_p, &s_rng);
 }
 
 static void print_stats(const m2_model *M, const char *what, const m2_tiers *before) {
@@ -1708,6 +1809,8 @@ int main(int argc, char **argv) {
     float mtp_gate = 0, mtp_gate1 = 0;
     const char *mtp_path = NULL;
     double ram_gb = -1, reserve = 0.6;
+    float temp = 0, top_p = 0;
+    int top_k = 0, rng_seed = 0, has_rng_seed = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
 #define NEXT() (i + 1 < argc ? argv[++i] : (usage(), ""))
@@ -1739,6 +1842,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--mtp-gate")) mtp_gate = (float)atof(NEXT());
         else if (!strcmp(a, "--mtp-gate-first")) mtp_gate1 = (float)atof(NEXT());
         else if (!strcmp(a, "-v")) verbose = 1;
+        else if (!strcmp(a, "--temp")) temp = (float)atof(NEXT());
+        else if (!strcmp(a, "--top-k")) top_k = atoi(NEXT());
+        else if (!strcmp(a, "--top-p")) top_p = (float)atof(NEXT());
+        else if (!strcmp(a, "--rng-seed")) { rng_seed = (unsigned)strtoul(NEXT(), NULL, 10); has_rng_seed = 1; }
         else usage();
 #undef NEXT
     }
@@ -1819,6 +1926,20 @@ int main(int argc, char **argv) {
     tiers_init(&M, reserve, slots, ram_gb);
     if (seed) profile_seed(&M, prof);
 
+    /* Sampling is a decode-path feature; MTP's verify accepts a draft only when
+     * it matches the trunk's own greedy pick, so a sampled trunk has nothing to
+     * verify against. Say so and run greedy rather than silently disagreeing. */
+    if (temp > 0.f && mtp_path) {
+        fprintf(stderr, "ds4-mimo2: --mtp verifies greedy picks; --temp needs --mtp off, ignoring --mtp\n");
+        M.n_mtp = 0;
+    }
+    s_temp = temp; s_top_p = top_p; s_top_k = top_k;
+    if (!has_rng_seed) rng_seed = (unsigned)(now_s() * 1000.0) ^ 0x9e3779b9u;
+    s_rng = rng_seed ? (uint64_t)rng_seed : 1u;
+    if (!bench && (temp > 0.f || top_k > 0 || top_p > 0.f))
+        fprintf(stderr, "ds4-mimo2: sampling temp %.3f top_k %d top_p %.3f rng-seed %u\n",
+                temp, top_k, top_p, rng_seed);
+
     if (score) {   /* every next token of the prompt, scored */
         double nll = 0;
         int agree = 0, cnt = 0;
@@ -1877,7 +1998,7 @@ int main(int argc, char **argv) {
     snap = M.tr;
     double td = now_s();
     int pos = pt.n, ngen = 0, nfwd = 0, nprod = 0;
-    int tok = argmax(M.h_logits, M.vb.n_vocab);
+    int tok = pick_tok(M.h_logits, M.vb.n_vocab);
     long drafted = 0, accepted = 0;
     double t_draft = 0;
     long acc_at[M2_MTP_MAX] = { 0 }, gated = 0, npass_k[M2_MTP_MAX + 1] = { 0 };
@@ -1973,7 +2094,7 @@ int main(int argc, char **argv) {
             forward(&M, &tok, 1, pos++, 1);
             nfwd++;
             nprod++;
-            tok = argmax(M.h_logits, M.vb.n_vocab);
+            tok = pick_tok(M.h_logits, M.vb.n_vocab);
         }
     }
     td = now_s() - td;
