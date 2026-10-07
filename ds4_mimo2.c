@@ -752,6 +752,12 @@ typedef struct {
     char *ram_pf;                   /* filled by lookahead, not used yet */               /* parts still being read, guarded by the io mutex */
     uint64_t hit_vram, hit_ram, miss_ssd, ssd_bytes, pf_reads, pf_hits, pf_used, demotions, on_cpu;
     double t_ssd, t_wait, t_cpu_wait;
+    /* Per-phase host-visible time, so a decode number says what it spent on.
+     * Only the parts that can stall the host are timed: the router download
+     * and CPU routing, the tier bookkeeping, the PCIe copy fence, the CPU
+     * expert pool, the SSD reads and the attention launch. Whatever is left
+     * of a token is GPU compute and launch overhead. */
+    double ph_route, ph_fetch, ph_copy, ph_attn;
     uint32_t count[M2_NEXP];        /* routing profile */
 } m2_tiers;
 
@@ -1048,7 +1054,17 @@ static void tiers_init(m2_model *M, double vram_reserve_gb, int max_slots, doubl
     if (nr < M2_NE + 32) nr = M2_NE + 32;
     if (nr > M2_NEXP) nr = M2_NEXP;
     const double t0 = now_s();
-    T->arena = m2g_host_alloc((size_t)nr * T->ram_stride);
+    /* Pin as much as the box will give. The arena is the whole reason the SSD is
+     * off the decode path, so a request that does not fit shrinks to what does
+     * instead of failing the run: when other tenants hold the RAM, a large arena
+     * is simply unavailable, and the run should proceed at the size that is. The
+     * floor is one full set of experts plus slack. */
+    const int nrfloor = M2_NE + 32;
+    while (nr > nrfloor && !(T->arena = m2g_host_alloc((size_t)nr * T->ram_stride))) {
+        const double left = nr * T->ram_stride / 1e9 - 8.0;
+        nr = left > 0 ? (int)(left * 1e9 / (double)T->ram_stride) : nrfloor;
+        if (nr < nrfloor) nr = nrfloor;
+    }
     if (!T->arena) die("could not pin %.1f GB of RAM for the expert arena", nr * T->ram_stride / 1e9);
     T->nram = nr;
     T->ram_owner = xmalloc((size_t)nr * sizeof(int));
@@ -1174,6 +1190,7 @@ static int slot_pick(m2_tiers *T) {
  * misses through transient slots and leaves the cached placement alone. */
 static void tiers_fetch(m2_model *M, const int *need, int n, int *slot_out, bool stream) {
     m2_tiers *T = &M->tr;
+    const double tf0 = now_s();
     T->tick++;
     int nmiss = 0, *miss = xmalloc((size_t)n * sizeof(int));
     for (int i = 0; i < n; i++) {
@@ -1233,7 +1250,8 @@ static void tiers_fetch(m2_model *M, const int *need, int n, int *slot_out, bool
             slot_out[i] = s;
         }
     }
-    if (nmiss) GCK(m2g_copy_fence());
+    if (nmiss) { const double tc = now_s(); GCK(m2g_copy_fence()); T->ph_copy += now_s() - tc; }
+    T->ph_fetch += now_s() - tf0;
     free(from_ssd);
     free(miss);
 }
@@ -1393,6 +1411,7 @@ static void moe_cpu_finish(m2_model *M, int nc, int n) {
 
 static void moe_layer(m2_model *M, int l, int n) {
     m2_layer *L = &M->L[l];
+    const double tr0 = now_s();
     GCK(m2g_matmul(M2_T_F32, L->router, M2_NE, M2_EMBD, M->xn, M2_EMBD, M->rlog, M2_NE, n, 0));
     GCK(m2g_download(M->h_rlog, M->rlog, (size_t)n * M2_NE * sizeof(float)));
     static int ids[8192 * M2_TOPK];
@@ -1427,6 +1446,8 @@ static void moe_layer(m2_model *M, int l, int n) {
             if (j >= 0) M->h_assign[fill[j]++] = t * M2_TOPK + k;
         }
     if (ngpu) {
+        M->tr.ph_route += now_s() - tr0;   /* the host-visible routing: router download,
+                                            * top-k over 256 experts, job and assignment build */
         GCK(m2g_upload_async(M->jobs, M->h_jobs, (size_t)ngpu * sizeof(m2_moe_job)));
         GCK(m2g_upload_async(M->assign, M->h_assign, (size_t)off * sizeof(int)));
         GCK(m2g_upload_async(M->wts, M->h_wts, (size_t)n * M2_TOPK * sizeof(float)));
@@ -1444,6 +1465,7 @@ static void moe_layer(m2_model *M, int l, int n) {
  * else routed experts (trunk layer l). */
 static void layer_body(m2_model *M, m2_layer *L, int l, float *x, int n, int pos0) {
     const int ldq = L->qkv_rows;
+    const double ta0 = now_s();
     GCK(m2g_rmsnorm(x, L->attn_norm, M->xn, M2_EMBD, n, M2_EPS));
     GCK(m2g_matmul(M2_T_Q8_0, L->qkv, ldq, M2_EMBD, M->xn, M2_EMBD, M->qkv, ldq, n, 0));
     GCK(m2g_attention(M->qkv, n, pos0, M2_NHEAD, L->n_kv, M2_NROT, L->rope_base,
@@ -1452,6 +1474,7 @@ static void layer_body(m2_model *M, m2_layer *L, int l, float *x, int n, int pos
                    M->tmp, M2_EMBD, n, 0));
     GCK(m2g_scale(M->tmp, M2_VSCALE, n * M2_EMBD));
     GCK(m2g_add(x, M->tmp, n * M2_EMBD));
+    M->tr.ph_attn += now_s() - ta0;   /* attention launch and the sliding-window pass */
     GCK(m2g_rmsnorm(x, L->ffn_norm, M->xn, M2_EMBD, n, M2_EPS));
     if (L->ffn_gate) {
         GCK(m2g_matmul(M2_T_Q8_0, L->ffn_gate, M2_FF, M2_EMBD, M->xn, M2_EMBD, M->gt, M2_FF, n, 0));
@@ -1605,7 +1628,7 @@ static void usage(void) {
         "  --ubatch N         prefill batch (default 1024)\n"
         "  --raw              do not apply the chat template\n"
         "  --think            leave thinking on (default: <think></think> prefilled)\n"
-        "  --ram-gb G         pinned RAM arena (default: min(40, MemAvailable - 8))\n"
+        "  --ram-gb G         pinned RAM arena (default: min(52, MemAvailable - 10), shrunk to what the box pins)\n"
         "  --slots N          cap the VRAM expert slots\n"
         "  --vram-reserve G   VRAM left free after slots (default 0.6)\n"
         "  --profile FILE     seed tiers from a routing profile\n"
@@ -1656,6 +1679,17 @@ static void print_stats(const m2_model *M, const char *what, const m2_tiers *bef
             tot ? 100.0 * ms / tot : 0, (T->ssd_bytes - before->ssd_bytes) / 1e9);
     fprintf(stderr, "ds4-mimo2: %s demotions VRAM->RAM: %llu, SSD wait %.1fs\n", what,
             (unsigned long long)(T->demotions - before->demotions), T->t_ssd - before->t_ssd);
+    /* Where the wall went, in the parts that can stall the host. The rest of a
+     * token is GPU compute and launch overhead, which is what is left over. */
+    {
+        const double ssd = T->t_ssd - before->t_ssd, cpu = T->t_cpu_wait - before->t_cpu_wait;
+        const double copy = T->ph_copy - before->ph_copy;
+        const double route = T->ph_route - before->ph_route, attn = T->ph_attn - before->ph_attn;
+        const double fetch = (T->ph_fetch - before->ph_fetch) - ssd - copy;
+        fprintf(stderr, "ds4-mimo2: %s phases: SSD %.2fs, copy %.2fs, CPU experts %.2fs, "
+                        "routing %.2fs, fetch %.2fs, attention %.2fs\n",
+                what, ssd, copy, cpu, route, fetch > 0 ? fetch : 0, attn);
+    }
     if (T->on_cpu > before->on_cpu)
         fprintf(stderr, "ds4-mimo2: %s RAM->CPU: %llu experts (%.1f%% of lookups), host idle waiting on CPU %.2fs\n", what,
                 (unsigned long long)(T->on_cpu - before->on_cpu), tot ? 100.0 * (T->on_cpu - before->on_cpu) / tot : 0,
@@ -1774,7 +1808,12 @@ int main(int argc, char **argv) {
     io_init(&M.io, io_threads < 1 ? 1 : io_threads > 16 ? 16 : io_threads);
     if (ram_gb < 0) {
         ram_gb = mem_available_gb() - 10;
-        if (ram_gb > 36) ram_gb = 36;
+        /* MiMo V2.6 Flash carries 12,032 routed experts at 9.96 MB each, 120 GB, on
+         * a box with 62 GB of RAM. Decode tracks the arena almost linearly until the
+         * SSD leaves the path: 36 GB gives 5.21 t/s, 44 gives 5.91, 52 gives 6.30.
+         * The cap is that measured knee; tiers_init shrinks it to whatever the box
+         * will actually pin. */
+        if (ram_gb > 52) ram_gb = 52;
         if (ram_gb < 4) ram_gb = 4;
     }
     tiers_init(&M, reserve, slots, ram_gb);

@@ -25,6 +25,7 @@ DS4 = {
     "decode_lookups": r"decode experts: (\d+) lookups",
     "decode_tiers": r"decode experts: \d+ lookups, VRAM ([\d.]+)%, RAM ([\d.]+)%, SSD ([\d.]+)% \(([\d.]+) GB read\)",
     "cpu_share": r"decode RAM->CPU: (\d+) experts \(([\d.]+)% of lookups\), host idle waiting on CPU ([\d.]+)s",
+    "phases": r"decode phases: SSD ([\d.]+)s, copy ([\d.]+)s, CPU experts ([\d.]+)s, routing ([\d.]+)s, fetch ([\d.]+)s, attention ([\d.]+)s",
     "mtp": r"MTP (\d+) verify passes, (\d+) drafted, (\d+) accepted \(([\d.]+)%\), ([\d.]+) tokens/pass",
     "score": r"score: (\d+) tokens, ppl ([\d.]+), top-1 agreement ([\d.]+)%",
     "tiers": r"tiers: (\d+) VRAM slots \(([\d.]+) GB\), (\d+) RAM entries \(([\d.]+) GB",

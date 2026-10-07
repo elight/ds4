@@ -59,6 +59,10 @@ sweep)
   STEPS=(
     'sweep|1500|misc/llmbox/mimo2-sweep.sh "$OUT/steps/sweep"'
   ) ;;
+profile)
+  STEPS=(
+    'profile|1500|misc/llmbox/mimo2-profile.sh "$OUT/steps/profile"'
+  ) ;;
 *) echo "mimo-bench: unknown queue '$QUEUE' (baseline|mtp|sweep)" >&2; exit 2 ;;
 esac
 

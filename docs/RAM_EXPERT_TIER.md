@@ -77,6 +77,30 @@ VRAM hit rate, RAM hit rate, SSD bytes per token. Results go in the table below.
 | 2026-10-07 | MiMo V2.6 Flash Q2_K | baseline, `--cpu-experts 1` | 5.18 | 2.59 | 41.5% | `mimo-bench.sh baseline` story step; 159 decoded, SSD wait 13.03 s of 30.69 s, 51.5% of lookups on the CPU |
 | 2026-10-07 | MiMo V2.6 Flash Q2_K | baseline, `--cpu-experts 0` | 3.66 | 2.59 | 65.8% | same window, 154 decoded, SSD wait 12.19 s of 41.99 s |
 | 2026-10-07 | MiMo V2.6 Flash Q2_K | llama.cpp, story | 4.70 | 1.67 | — | same story prompt, `-ngl 99 -ot exps=CPU -c 4096 -t 10` |
+| 2026-10-07 | MiMo V2.6 Flash Q2_K | RAM tier 44 GB | 5.91 | — | 39.9% | story, `--ram-gb 44`; SSD wait 9.89 s of 26.91 s, SSD share 5.4% |
+| 2026-10-07 | MiMo V2.6 Flash Q2_K | RAM tier 52 GB | 6.30 | — | 40.2% | story, `--ram-gb 52`; SSD wait 8.38 s of 25.25 s, SSD share 4.5% |
+| 2026-10-07 | MiMo V2.6 Flash Q2_K | RAM tier default (45.2 GB pinned) | 5.98 | — | 40.3% | story, no `--ram-gb`; SSD wait 9.31 s of 25.42 s, SSD share 5.3%, against 13.01 s and 7.1% at the old 36 GB cap |
+
+### Where a MiMo decode token goes
+
+`ds4-mimo2` prints a phase breakdown per measured pass. On the 36 GB story run:
+SSD 13.01 s, copy 0.00 s, CPU experts 0.10 s, routing 23.72 s, fetch 0.30 s,
+attention 0.10 s, of 30.51 s total.
+
+The routing column is not host cost. `m2g_download` is an async copy followed by a
+stream synchronize, so the router download at the top of a layer drains the
+compute stream: what is measured in it is the previous layer's GPU MoE, waited
+on. The host's own share is the 256 sigmoids and the top-8 scan, about 2,300
+flops per token-layer. A MiMo decode token is roughly 42% SSD wait and 34% GPU
+MoE at the 36 GB tier; the SSD share falls to 4.5% at 52 GB.
+
+Two things measured and rejected. Seeding the tiers from a routing profile built
+by a decode-heavy pass made the story run marginally slower, 5.16 t/s against
+5.21, SSD share unchanged at 7.1%: LRU over 12,032 experts with 1,793 slots
+already places about as well as a static ranking. And the CPU expert split does
+not collapse the VRAM hit rate — 41.5% against 65.8% is the split working as
+designed, because a RAM-tier expert computed on the CPU is never promoted into a
+VRAM slot, and the run is 42% faster for it.
 | 2026-10-07 | MiMo V2.6 Flash Q2_K | baseline, 2203-token prompt | 3.25 | 17.89 | 36.0% | ctx 8192 ubatch 1024, `--cpu-experts 1`; prefill reads 65.5% of experts from SSD |
 | 2026-10-07 | MiMo V2.6 Flash Q2_K | llama.cpp, 2203-token prompt | 3.87 | 17.54 | — | same prompt, `-b 1024 -ub 1024` |
 

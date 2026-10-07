@@ -22,7 +22,7 @@ for cpu in ${CPUS:-1}; do
   echo "=== ds4 cpu-experts $cpu"
   "$HERE/ds4-mimo2" -m "$M" -f "$P" --raw -n "$N" --ctx "$CTX" --ubatch "$UB" \
     --cpu-experts "$cpu" ${EXTRA:-} > "$OUT/prefill-ds4-cpu$cpu.txt" 2> "$OUT/prefill-ds4-cpu$cpu.err"
-  grep -E "t/s|experts:" "$OUT/prefill-ds4-cpu$cpu.err"
+  grep -E "t/s|experts:|phases:" "$OUT/prefill-ds4-cpu$cpu.err"
 done
 if [ "${LLAMA_RUN:-1}" = 1 ]; then
   echo "=== llama.cpp"
