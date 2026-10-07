@@ -509,6 +509,20 @@ ds4_cpu_experts.o: ds4_cpu_experts.c ds4_cpu_experts.h ds4_cpu_experts_grid.inc
 tests/test_cpu_experts: tests/test_cpu_experts.c ds4_cpu_experts.o
 	$(CC) $(CFLAGS) -std=c11 -o $@ tests/test_cpu_experts.c ds4_cpu_experts.o -lm -pthread
 
+# MiMo V2.6 Flash. The matmul test checks every weight type the MiMo GGUFs carry
+# against gguf-py's own dequantizers, so it needs the GPU and reference data from
+# tests/mimo2_matmul_ref.py; that is why it is its own target and not in `test`.
+# Linked with nvcc because ds4_mimo2_cuda.o carries the C++17 runtime.
+# The test exercises the kernel layer only (m2g_*), so it links against
+# ds4_mimo2_cuda.o and not ds4_mimo2.o, which carries the CLI's main.
+tests/test_mimo2_matmul: tests/test_mimo2_matmul.c ds4_mimo2_cuda.o ds4_cpu_experts.o
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $^ $(CUDA_LDLIBS)
+
+test-mimo2: tests/test_mimo2_matmul tests/test_cpu_experts ds4-mimo2
+	./tests/test_cpu_experts
+	./tests/test_mimo2_matmul $(MIMO2_REFDATA)
+
+
 ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_image.c
 
