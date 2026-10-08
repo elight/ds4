@@ -353,3 +353,31 @@ holding 288 slots across 46 layers is 6 slots per layer — 2% of the 288 expert
 Strata's measured per-layer curve says 8 slots/layer already gives 21.4% hits.
 So the first optimization is the one Strata measures as the biggest: **per-layer
 expert slots**, and the baseline to beat is this row.
+
+## Quality distance: what is and is not measurable on this box
+
+The contract asks for measured quality distance against the highest-precision
+artifact reachable here. Stated plainly, with the numbers behind it:
+
+- **The official FP8 artifact is not reachable.** 304.74 GiB, ds4 lists FP8
+  inference as not implemented for the paired FP8-code/scale format
+  (`docs/MODELS.md`), and this box has 51.75 GB of available RAM with strata
+  stopped. No token-space KLD against FP8 can be produced here.
+- **Q4_K is not reachable either** — no CUDA MoE route (above). So the
+  highest-precision artifact that runs on this box is **Q2 itself**, and a
+  distance to a higher-precision reference is therefore not measurable as a
+  pair of runs.
+- **Weight-space RMSE is not computable in this tree**: no dequantize path
+  exists for Q2_K/Q6_K/Q4_K_S in Python (`gguf-tools/glm53_quantize.py` has
+  quantize/plan code only, no dequant), and `gguf-tools/quants.h` exposes no
+  `dequantize_row` entry point.
+- **What is measurable is the repo's own task-level gate**: the GLM 5.3 Flash
+  Z.AI FP8 100-case continuation fixture
+  (`gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-100/manifest.tsv`,
+  101 rows, continuations ~507 bytes ≈ 130 tokens each). At the measured 1.15
+  t/s that is ~3.1 hours of generation, which does not fit a benchmark window,
+  so the fixture is scored **after the first decode win**, and every accepted
+  optimization is gated on it not falling below that first scored baseline.
+
+Measured density and geometry stand in for quality distance in the ranking, and
+the ranking is unchanged by this: Q2 is the artifact, Q4_K is the kernel target.
