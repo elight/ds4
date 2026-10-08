@@ -27189,7 +27189,14 @@ static int cuda_stream_selected_cache_begin_load(
             if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, g_gpu[0].device_id) == cudaSuccess &&
                 integrated && ds4_linux_nonmovable_memory(&host_available))
                 free_bytes = (size_t)std::min(host_available, (uint64_t)total_bytes);
-            const uint64_t reserve = UINT64_C(8) << 30;
+            /* Reserve is a policy number, not a constant: on a 24 GB card an 8 GiB
+             * reserve leaves the streaming expert pool too small to stage one
+             * layer's experts once the dense weights and context buffers are
+             * resident (docs/GLM53_DS4_LEVERS.md lever 3). Default keeps the prior
+             * behaviour; DS4_CUDA_STREAM_EXPERT_RESERVE_MB lowers it. */
+            int reserve_present = 0;
+            uint64_t reserve = cuda_parse_mib_env("DS4_CUDA_STREAM_EXPERT_RESERVE_MB", &reserve_present);
+            if (!reserve_present) reserve = UINT64_C(8) << 30;
             const uint64_t available = free_bytes > reserve ? free_bytes - reserve : 0;
             capacity = std::min(capacity, available / expert_bytes);
             if (capacity < unique.size()) {
@@ -27245,16 +27252,39 @@ static int cuda_stream_selected_cache_begin_load(
             slot.used = stamp;
         }
         cuda_stream_upload_batch uploads;
+        /* Per-layer expert slots (docs/GLM53_DS4_LEVERS.md lever 3, Strata's
+         * --expert-cache-per-layer): a layer evicts its own experts first, so a
+         * hot layer cannot take a cold layer's whole working set. A slot's layer
+         * is its gate offset, so no layer count is needed. Empty slots (gate 0,
+         * used 0) belong to no layer and are always candidates. Global LRU stays
+         * as the fallback so a layer that owns no slot can still load. */
+        const uint64_t layer_gate_lo = table->gate_offset;
+        const uint64_t layer_gate_hi = table->gate_offset +
+            (uint64_t)table->n_total_expert * table->gate_expert_bytes;
         for (size_t i = 0; i < unique.size(); i++) {
             if (slots[i] >= 0) continue;
             uint32_t victim = UINT32_MAX;
             uint64_t oldest = stamp;
             for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
-                if (!cuda_stream_prefetch_protects(g_stream_expert_slots[j]) &&
-                    g_stream_expert_slots[j].used < oldest) {
-                    oldest = g_stream_expert_slots[j].used;
+                const cuda_stream_expert_slot &s = g_stream_expert_slots[j];
+                const bool empty = s.used == 0 && s.gate == 0;
+                if (!empty && (s.gate < layer_gate_lo || s.gate >= layer_gate_hi))
+                    continue;
+                if (!cuda_stream_prefetch_protects(s) && s.used < oldest) {
+                    oldest = s.used;
                     victim = j;
                     if (!oldest) break;
+                }
+            }
+            if (victim == UINT32_MAX) {
+                oldest = stamp;
+                for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
+                    if (!cuda_stream_prefetch_protects(g_stream_expert_slots[j]) &&
+                        g_stream_expert_slots[j].used < oldest) {
+                        oldest = g_stream_expert_slots[j].used;
+                        victim = j;
+                        if (!oldest) break;
+                    }
                 }
             }
             if (victim == UINT32_MAX) return 0;
