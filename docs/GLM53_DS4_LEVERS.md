@@ -100,3 +100,27 @@ and the 8 GiB hardcoded reserve at `ds4_cuda.cu:27192` is exactly what keeps the
 179 `DS4_CUDA_*` env knobs in `ds4_cuda.cu` and 892 `DS4_*` in `ds4.c`. Each is a
 measurable ablation; `DS4_CUDA_DISABLE_SSD_PREFETCH` is the one that isolates the
 largest single effect.
+
+## Lever 1 fixed and measured: the guard rung
+
+Added a sub-108 GiB rung to `glm_graph_memory_guard_default_reserve_gib()`
+(`ds4.c:44908`): reserve = max(2 GiB, base/8), so this box's 23.56 GiB base gets a
+2.95 GiB reserve instead of the 32 GiB fallback that collapsed the budget to zero.
+
+Why it mattered more than it looked: with the budget at zero, the streaming
+planner printed `GLM SSD streaming request adjusted to fit memory: … cache 920 -> 0
+experts` — the expert cache was being **zeroed**, which is why cache size had no
+effect on decode in the first sweep.
+
+Measured, same prompt/ctx/gen-tokens, guard left ON (no `DS4_GLM_MEMORY_GUARD=0`):
+
+| Run | prefill t/s | gen t/s | first token |
+|---|---:|---:|---:|
+| baseline, guard bypassed, cache default (288 slots, 1.90 GiB) | 61.77 | 1.15 | 873.8 ms |
+| cache 288, guard rung, no bypass | 62.04 | 1.15 | 873.1 ms |
+| **cache 920 (6.06 GiB), guard rung, no bypass** | **64.05** | **1.44** | **816.7 ms** |
+| cache 1800, guard rung | — | — | `CUDA model arena alloc failed for q8_0 (1024.00 MiB): out of memory` at `blk.40.kda_v.weight` |
+
+Decode 1.15 → **1.44 t/s (+25%)**, prefill 61.77 → 64.05 (+3.2%). The 1800-slot
+run shows the ceiling: 1800 × 6.31 MiB = 11.4 GiB of cache plus 7.4 GiB of dense
+weights plus 2.92 GiB of context buffers exceeds the 23.56 GiB base.

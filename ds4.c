@@ -44925,6 +44925,15 @@ static double glm_graph_memory_guard_default_reserve_gib(
          * resident-Q2 budget without imposing it on larger machines. */
         return 18.0;
     }
+    if (base_gib < 108.0) {
+        /* Discrete-GPU hosts: a 24 GB card reports a ~23.5 GiB base, where the
+         * 32 GiB fallback reserve exceeds the base entirely and collapses the
+         * budget to zero (ds4.c:44941), which zeroes the streaming expert cache
+         * and leaves decode streaming every expert. Scale the reserve to the
+         * base instead. docs/GLM53_DS4_LEVERS.md lever 1. */
+        const double scaled = base_gib / 8.0;
+        return scaled < 2.0 ? 2.0 : scaled;
+    }
     return 32.0;
 }
 
