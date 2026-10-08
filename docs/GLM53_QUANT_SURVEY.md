@@ -316,3 +316,40 @@ today is IQ2_XXS gate + Q2_K down — exactly antirez's Q2 file. Q4_K is not a
 tuning target; it needs route 2 written. So the working artifact is Q2, and the
 thing to fix first is Q2's blocker, which is an allocation, not a kernel:
 `CUDA model arena alloc failed for Q4_K (1792.00 MiB)` on `blk.10.kda_q.weight`.
+
+## First measured run: GLM 5.3 Flash Q2 on the 3090
+
+Two env knobs turn "cannot load" into "runs". `cuda_model_arena_chunk_bytes()`
+(`ds4_cuda.cu:2385`) defaults to a **1792 MiB** arena chunk, overridable with
+`DS4_CUDA_WEIGHT_ARENA_CHUNK_MB` (clamped 256–8192), and the q8/fp16 cache
+reserve is `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB`, default 4096 — the `reserve=4.00
+GiB` in the failure line. With the chunk at 1024 and the reserve at 1024, the
+arena allocations succeed:
+
+```
+$ DS4_GLM_MEMORY_GUARD=0 DS4_CUDA_WEIGHT_ARENA_CHUNK_MB=1024 \
+  DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=1024 \
+  ./ds4-bench -m /srv/models/gguf/glm53/GLM-5.3-Flash-Q2.gguf \
+    --cuda --ssd-streaming --power 100 \
+    --prompt-file tests/long_context_story_prompt.txt \
+    --ctx-start 4096 --ctx-max 4096 --gen-tokens 128
+ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes
+4096,4096,61.77,128,1.15,873.759,127,1.15,0
+```
+
+| | this run | published Q4_K on 128 GB M5 Max | strata on this box |
+|---|---:|---:|---:|
+| prefill t/s | **61.77** | 121 / 104 | 56.1 |
+| generation t/s | **1.15** | 11.9 / 14.9 | 55.4 |
+
+First token 873.8 ms, steady 1.15 t/s, planned VRAM 5.09 GiB (KV 0.05 + buffers
+2.92 + resident model 2.12), CUDA SSD expert cache 288 slots = 1.90 GiB.
+
+**Decode is the whole problem.** 1.15 t/s against 11.9 t/s published for the
+same model class on a Mac, and 55.4 t/s for strata on this very card. Prefill is
+respectable (61.77 vs 104 published). The gap is expert streaming: at top-k 8
+and 6.31 MiB per expert, a full miss costs 50.5 MiB per token, and the cache
+holding 288 slots across 46 layers is 6 slots per layer — 2% of the 288 experts.
+Strata's measured per-layer curve says 8 slots/layer already gives 21.4% hits.
+So the first optimization is the one Strata measures as the biggest: **per-layer
+expert slots**, and the baseline to beat is this row.
