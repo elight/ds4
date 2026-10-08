@@ -153,3 +153,36 @@ Re-measured on that platform, card verified free before the window, guard ON, no
 
 Against the baseline (61.77 prefill, 1.15 generation): **prefill +3.1%,
 generation +24%**. Cache 1800 exceeds the base and fails in the dense arena.
+
+## Rejected: per-layer expert-slot eviction (measured −12% on decode)
+
+Strata's biggest measured win is per-layer expert slots
+(`--expert-cache-per-layer`: 2.97% → 21.4% → 70.4% hits at 1/8/64 slots per
+layer), so it was implemented in ds4's CUDA streaming cache: a slot's layer is
+derived from its gate offset (`table->gate_offset` …
+`+ n_total_expert × gate_expert_bytes`), and the victim scan prefers slots
+holding the requesting layer's own experts, with global LRU kept as the fallback
+so a layer that owns no slot can still load. An ablation switch
+(`DS4_CUDA_DISABLE_EXPERT_PER_LAYER_EVICT`) made it measurable in one binary.
+
+A/B in one window, card verified free, guard ON, cache 920, ctx 4096, 128
+generated tokens (`~/claude-tmp/glm53-sweep-abl2.txt`):
+
+| run | prefill t/s | gen t/s | steady t/s |
+|---|---:|---:|---:|
+| cache 288 (warm-up) | 62.22 | 1.15 | 1.15 |
+| **cache 920, per-layer eviction OFF** | 63.78 | **1.63** | **1.64** |
+| cache 920, per-layer eviction ON | 63.85 | 1.44 | 1.44 |
+
+Per-layer reservation costs **12% of decode** (1.63 → 1.44). Prefill is
+unchanged. The patch is reverted; global LRU is the better policy for this
+cache. The likely reason is visible in the numbers: with 920 slots over 46
+layers, a per-layer reservation is 20 slots, and a layer's top-8 selection
+repeats heavily within a token burst — global LRU lets the hot experts of the
+current layer keep slots that a strict per-layer quota would evict.
+
+**Best accepted configuration so far** (guard rung + `DS4_CUDA_STREAM_EXPERT_
+RESERVE_MB=2048` + `DS4_CUDA_Q8_F16_CACHE_MB=1024` +
+`DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=512` + cache 920, global LRU):
+**63.78 t/s prefill, 1.63 t/s generation** against the 61.77 / 1.15 baseline —
+**prefill +3.3%, generation +42%**.
