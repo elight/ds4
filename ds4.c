@@ -39318,8 +39318,21 @@ static uint32_t glm_graph_batch_row_cap(
         bool     expanded_kv) {
     if (ds4_model_is_glm53()) {
         uint32_t cap = full_attention_cap;
-        if (cap > DS4_GLM53_PREFILL_CHUNK_TOKENS) {
-            cap = DS4_GLM53_PREFILL_CHUNK_TOKENS;
+        /* Chunk size is a tuning surface with no knob today: DS4_GLM53_PREFILL_
+         * CHUNK_TOKENS is a compile-time 2048 (ds4.c:39042), while Metal and
+         * Qwen4 both expose an env override. Adding DS4_GLM53_PREFILL_CHUNK makes
+         * the prefill chunk measurable on CUDA (docs/GLM53_DS4_LEVERS.md lever 6).
+         * Clamped to the 256..8192 range the other chunk knobs use. */
+        uint32_t chunk = DS4_GLM53_PREFILL_CHUNK_TOKENS;
+        const char *env = getenv("DS4_GLM53_PREFILL_CHUNK");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long v = strtoul(env, &end, 10);
+            if (end != env && *end == '\0' && v >= 256u && v <= 8192u)
+                chunk = (uint32_t)v;
+        }
+        if (cap > chunk) {
+            cap = chunk;
         }
         if (indexed_prefill_cap != 0 && cap > indexed_prefill_cap) {
             cap = indexed_prefill_cap;

@@ -223,3 +223,32 @@ Generation at 920 measured 1.43, 1.44 and 1.43 in three separate windows, and
 1.63 once (`~/claude-tmp/glm53-sweep-abl2.txt`); the spread is window state, not
 cache size. Against the 61.77 / 1.15 baseline: **prefill +3.3%, generation
 +24%**.
+
+## Cache ceiling: 1200 experts is the largest that fits, and the fastest
+
+Warm-window sweeps (`~/claude-tmp/glm53-sweep-ceiling.txt`,
+`~/claude-tmp/glm53-sweep-ceiling2.txt`), same protocol as the accepted table:
+
+| cache experts | cache bytes | prefill t/s | gen t/s | first token |
+|---:|---:|---:|---:|---:|
+| 288 (default) | 1.90 GiB | 62.03–62.15 | 1.15 | ~870 ms |
+| 920 | 6.06 GiB | 63.78–63.87 | 1.43–1.44 | 818–821 ms |
+| **1200** | **7.89 GiB** | **63.93** | **1.47** | **799.5 ms** |
+| 1300 | 8.54 GiB | — | — | fails: dense `q8_0` arena |
+| 1400 | 9.20 GiB | — | — | fails: dense `q8_0` arena |
+| 1200 with `DS4_CUDA_Q8_F16_CACHE_MB=2048` | 7.89 GiB | — | — | fails: the bigger staging cache takes the room the cache needed |
+
+The last row is the trade stated plainly: on this card the Q8→F16 staging cache
+and the streaming expert cache draw from the same VRAM, and giving staging 2 GiB
+instead of 1 GiB makes a 1200-expert cache stop fitting.
+
+**Two neutral levers, measured and not adopted:**
+- SSD prefetch (`DS4_CUDA_DISABLE_SSD_PREFETCH`, `ds4_cuda.cu:108/:1985`):
+  1.43 t/s off vs 1.44 t/s on at cache 920 — no measurable contribution
+  (`~/claude-tmp/glm53-sweep-prefetch.txt`). Strata's 39 MB/s → 3.2 GB/s
+  read-ahead win does not show up here.
+- Prefill chunk (`DS4_GLM53_PREFILL_CHUNK`, added at `ds4.c:39321`): 2048 →
+  63.81 t/s, 4096 → 63.74 t/s, 1024 → fails. Prefill is not chunk-limited;
+  it batches expert reuse across the 2048-token chunk, which is why prefill
+  costs 15.7 ms/token while decode costs 870 ms/token for the same experts
+  (`~/claude-tmp/glm53-sweep-chunk.txt`).
