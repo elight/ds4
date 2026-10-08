@@ -195,3 +195,51 @@ Two separate blockers, both specific:
 So the Q4 arm is not a tuning problem, it is a missing kernel path: **ds4 CUDA
 has no Q4_K_S routed-expert support for GLM 5.3 Flash.** That is a lever, not a
 dead end, and it is the first entry in the optimization list.
+
+## Q2 arm — it gets further, and fails somewhere else
+
+Window `~/claude-tmp/glm53-bench-q2-guardoff.txt` (ctx 4096, guard bypassed,
+strata stopped and restored, ready in 66 s):
+
+```
+ds4: CUDA SSD expert cache: 288 slots, 1.90 GiB
+ds4: moe gateup y-indirect q8 staging engage (flat-pool p5b, first n_tokens=2048 n_assign=16384)
+ds4: CUDA q8 fp16 cache budget exhausted; using q8 kernels (request=16.00 MiB cached=0.14 GiB free=1.63 GiB reserve=4.00 GiB total=23.5…)
+ds4: CUDA model arena alloc failed for Q4_K (1792.00 MiB chunk): out of memory
+ds4: GLM-5.3 KDA failed at layer 10 stage 'Q projection' on tensor blk.10.kda_q.weight (q4_k; pos 0, rows 2048)
+```
+
+Q2's routed experts are the supported layout (imatrix IQ2_XXS gate/up + Q2_K
+down, `docs/MODELS.md`), so the MoE path engages. What kills it is the
+**non-routed** side: GLM's KDA attention weights are `q4_k`, and the CUDA model
+arena cannot allocate the 1792 MiB chunk for them — it reports `free=1.63 GiB`
+against a `reserve=4.00 GiB`, with the 1.90 GiB expert cache already spent.
+
+## The choice, and why
+
+| Artifact | Size | Routed layout | How it fails on this box | Distance to done |
+|---|---:|---|---|---|
+| antirez Q4_K | 177.77 GiB | Q4_K_S (type 12) gate/up/down | `unsupported types 12/12/12`, dies at token 0 | needs a new CUDA routed kernel path |
+| antirez Q2 | 89.88 GiB | IQ2_XXS gate/up + Q2_K down (supported) | MoE engages; dies in the KDA dense path on a 1792 MiB arena alloc | needs the dense/attention weights to fit the arena |
+
+**Chosen: Q2 as the working artifact, Q4_K as the kernel-path target.** Q2 is
+the only artifact whose routed experts ds4's CUDA path can already execute, and
+its failure is an allocation-sizing problem on a box with 51.75 GB of RAM
+available and a 4 GiB reserve — a sizing bug, not a missing kernel. Q4_K needs
+work no flag can avoid: a Q4_K_S routed-expert CUDA kernel.
+
+Both arms share one prerequisite: the memory guard's 32 GiB fallback reserve
+(`ds4.c:44908`), which on a 23.56 GiB base leaves a 0.00 GiB budget and refuses
+every context. Nothing runs on this card without that rung fixed.
+
+## Reference reachability, stated plainly
+
+The official FP8 artifact (304.74 GiB) **cannot be used as a KLD reference on
+this box**: ds4 lists FP8 inference as not implemented for the paired
+FP8-code/scale format (`docs/MODELS.md`), and 51.75 GB of available RAM cannot
+run a 304.74 GiB model. So the quality reference used here is **Q4_K as the
+higher-precision artifact**, with the repo's own Z.AI FP8 continuation fixture
+(`gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-100/`) as the
+task-level gate. Weight-space distance between Q2 and Q4_K is computable offline
+and is the remaining measurement; token-space KLD against true FP8 is not
+measurable on this hardware, and no number in this goal claims otherwise.
