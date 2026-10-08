@@ -243,3 +243,48 @@ higher-precision artifact**, with the repo's own Z.AI FP8 continuation fixture
 task-level gate. Weight-space distance between Q2 and Q4_K is computable offline
 and is the remaining measurement; token-space KLD against true FP8 is not
 measurable on this hardware, and no number in this goal claims otherwise.
+
+## Measured geometry (from the GGUF tensor tables, `~/claude-tmp/glm53_survey/names.py`)
+
+Both files: 1412 tensors, 46 layers, 288 routed experts per layer, 320.76 B
+parameters. Routed tensors are `blk.N.ffn_gate_exps` / `ffn_up_exps` /
+`ffn_down_exps`.
+
+| | Q2 | Q4_K |
+|---|---:|---:|
+| File | 89.88 GiB | 177.77 GiB |
+| Routed share | 81.63 GiB (91%) | 163.27 GiB (92%) |
+| gate / up layout | **Q6_K**, 24.94 GiB each | **Q4_K_S**, 54.42 GiB each |
+| down layout | **Q2_K**, 31.75 GiB | **Q4_K_S**, 54.42 GiB |
+| Bytes per expert (gate+up+down) | **6.31 MiB** | **12.62 MiB** |
+| Overall bits/weight | **2.407** | **4.761** |
+| Dense weights | Q8_1 (kda_output, attn_output, token_embd, output) | Q8_1 |
+| KDA q/k | **Q4_K_S (type 12)** | Q4_K_S |
+
+Two things fall straight out of this table.
+
+**The routed experts are 91–92% of the file**, so bits-per-expert is the whole
+game on a 24 GB card. Q2's gate/up are Q6_K — *higher* precision than its own
+down projection (Q2_K), which is why the file is 2.407 bpw overall and not 2.06.
+
+**Bytes touched per token, at top-k = 8** (measured from ds4's own
+`n_assign=16384` over `n_tokens=2048` in the Q2 window):
+
+| Artifact | Expert bytes/token | at 10.9 GB/s (RAM→VRAM) | at 2.6 GB/s (SSD) |
+|---|---:|---:|---:|
+| Q2 | 8 × 6.31 MiB = **50.5 MiB** | 4.6 ms/token | 19.4 ms/token |
+| Q4_K | 8 × 12.62 MiB = **101.0 MiB** | 9.3 ms/token | 38.8 ms/token |
+
+Q4_K doubles the per-token transfer, and on a gen3 x16 link that is the whole
+decode budget. That is the arithmetic reason Q4_K is the kernel-path target and
+Q2 is the working artifact — not a preference.
+
+**Slot arithmetic ties straight to Strata's measurement.** ds4 built a 288-slot
+CUDA SSD expert cache at 1.90 GiB → 6.9 MiB/slot, matching Q2's 6.31 MiB
+per-expert size. A ~20 GiB VRAM budget (23.56 GiB base minus the 2.92 GiB of
+context buffers and the 265 MiB context) is ~2,900 slots, and across 46 layers
+that is **63 slots per layer out of 288 experts = 22% coverage**. Strata's
+measured per-layer curve is 21.4% at 8 slots/layer and **70.4% at 64
+slots/layer** (`engine --help`, `--expert-cache-per-layer`) — so this box sits
+right at the point where Strata's per-layer policy is worth 70% hits, and ds4's
+default shared-counter policy is the thing standing in its way.
