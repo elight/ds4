@@ -166,3 +166,32 @@ checksum `c7a0d950…25221`), then antirez Q2 (89.88 GiB, downloaded, checksum
 play (DogContext's ds4 file, aj9o9 AJ-IQ2_XXS). Measure routed-expert bytes per
 token and bits-per-expert from the GGUF tensor tables, and quality distance
 against the highest-precision artifact this box can actually reach.
+
+## Load test, Q4_K first (as instructed) — and it failed for a specific reason
+
+Window `~/claude-tmp/glm53-bench-q4k-guardoff.txt`, commit 0aaea5a, ctx 4096,
+`--cuda --ssd-streaming --power 100`, strata stopped and restored (ready in 60 s).
+
+Two separate blockers, both specific:
+
+1. **The GLM memory guard leaves a 24 GB CUDA box with a zero budget.**
+   `ds4.c:44908 glm_graph_memory_guard_default_reserve_gib()` returns 24.0 GiB for
+   a 480–640 GiB base, 18.0 GiB for a 108–160 GiB base (the 128 GB Mac case), and
+   **32.0 GiB as the fallback for everything else**. This box's base is 23.56 GiB,
+   so `reserve_bytes >= budget_base` and `ds4.c:44941` collapses the budget to 0:
+   `guard budget: 0.00 GiB (base 23.56 GiB, fraction 0.99, reserve 32.00 GiB)` →
+   `GLM memory guard refused ctx=8321`. The reserve ladder has no rung below a
+   108 GiB base, so on this card every context is refused.
+2. **With the guard bypassed (`DS4_GLM_MEMORY_GUARD=0`), the routed experts are
+   an unsupported quant type.** The file loads and maps (4.08 GiB streamed model
+   map of a 177.77 GiB file, 7.05 GiB planned), then:
+   `ds4: glm routed moe: unsupported types 12/12/12` and
+   `ds4-bench: prefill to 4096 failed: cuda GLM-5.3 prefill failed at token 0`.
+   GGUF type 12 is **Q4_K_S** (`gguf-tools/glm53_quantize.py`: `QTYPE_Q4_K_S` is
+   not in its table; it lists `QTYPE_Q4_K = 12`), and all three routed matrices —
+   gate, up, down — report 12. `docs/MODELS.md` advertises GLM routed paths in
+   IQ2_XXS, Q2_K and Q4_K; on CUDA, Q4_K_S in the routed path is not implemented.
+
+So the Q4 arm is not a tuning problem, it is a missing kernel path: **ds4 CUDA
+has no Q4_K_S routed-expert support for GLM 5.3 Flash.** That is a lever, not a
+dead end, and it is the first entry in the optimization list.
