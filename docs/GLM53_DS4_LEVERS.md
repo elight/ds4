@@ -124,3 +124,32 @@ Measured, same prompt/ctx/gen-tokens, guard left ON (no `DS4_GLM_MEMORY_GUARD=0`
 Decode 1.15 → **1.44 t/s (+25%)**, prefill 61.77 → 64.05 (+3.2%). The 1800-slot
 run shows the ceiling: 1800 × 6.31 MiB = 11.4 GiB of cache plus 7.4 GiB of dense
 weights plus 2.92 GiB of context buffers exceeds the 23.56 GiB base.
+
+## The guard rung oversubscribed the card; the q8 staging cap is what makes it fit
+
+The 920-slot row above is **not reproducible from a cold card**, and finding out
+why is what produced the stable configuration. With the card verified free
+(`nvidia-smi --query-gpu=memory.used` = 1 MiB before the run), cache 920 failed
+with `CUDA model arena alloc failed for q8_0 (1024.00 MiB chunk): out of memory`,
+and so did 300, 500, 700 and 288 at an arena chunk of 256 MiB.
+
+The mechanism is the guard rung itself. With the budget at zero, the streaming
+planner zeroed the expert cache and every allocation stayed small; giving the box
+a real 20.3 GiB budget let ds4 plan a larger q8/fp16 staging cache, and the
+staging cache plus the dense weights plus the expert cache exceeded the 23.56 GiB
+base. Capping the staging cache — `DS4_CUDA_Q8_F16_CACHE_MB=1024`,
+`DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=512` (`ds4_cuda.cu:1488`, `:1494`) — makes the
+run reproducible from a cold card.
+
+Re-measured on that platform, card verified free before the window, guard ON, no
+`DS4_GLM_MEMORY_GUARD=0`, ctx 4096, 128 generated tokens,
+`tests/long_context_story_prompt.txt`:
+
+| cache experts | cache bytes | prefill t/s | gen t/s | first token |
+|---:|---:|---:|---:|---:|
+| 288 (default) | 1.90 GiB | 62.25 | 1.15 | 867.7 ms |
+| 500 | 3.29 GiB | 63.72 | 1.38 | 863.7 ms |
+| **920** | **6.06 GiB** | **63.70** | **1.43** | **826.0 ms** |
+
+Against the baseline (61.77 prefill, 1.15 generation): **prefill +3.1%,
+generation +24%**. Cache 1800 exceeds the base and fails in the dense arena.
