@@ -288,3 +288,31 @@ measured per-layer curve is 21.4% at 8 slots/layer and **70.4% at 64
 slots/layer** (`engine --help`, `--expert-cache-per-layer`) — so this box sits
 right at the point where Strata's per-layer policy is worth 70% hits, and ds4's
 default shared-counter policy is the thing standing in its way.
+
+## Why Q4_K cannot run MoE on CUDA in this tree — all three routes closed
+
+`ds4.c:48573 glm_graph_routed_moe_batch_dispatch()` has exactly three routes, and
+the Q4_K layout (gate 12 / up 12 / down 12, `DS4_TENSOR_Q4_K = 12` at
+`ds4.c:2363`) is accepted by none of them:
+
+| Route | Gate on types | Q4_K 12/12/12 |
+|---|---|---|
+| 1. generic routed MoE | `ds4.c:46081` — gate type must be `DS4_TENSOR_IQ2_XXS` (16) | refused |
+| 2. direct scalar Q4 | `ds4_cuda.cu:31434` — **body is a stub**: prints "CUDA stub called…" and `return 0` | not implemented |
+| 3. batch routed MoE | `ds4_cuda.cu:32101` — `gate_type != 10u \|\| up_type != 10u \|\| down_type != 10u` → refuse | refused |
+
+Route 3's message is what the Q4_K window printed (`unsupported types 12/12/12`).
+Route 2 is reachable only when `direct_scalar_q4` is true, which prefill computes
+as `!use_grouped_moe` (`ds4.c:50399`), and `glm_graph_indexed_prefill_grouped_moe_default()`
+is `g && !g->quality` (`ds4.c:49920`). Running with `--quality`
+(`ds4_cli.c:2057`, honoured by ds4-bench at `ds4_bench.c:329`) was tested in a
+window — `~/claude-tmp/glm53-bench-q4k-quality.txt` — and it still printed
+`unsupported types 12/12/12` with **zero** stub messages, so the graph's
+`quality` flag did not reach the dispatch. Decode is harder still: the decode
+dispatch passes `direct_scalar_q4 = false` as a literal (`ds4.c:51044`).
+
+**Consequence for the quant choice.** The only routed layout CUDA can execute
+today is IQ2_XXS gate + Q2_K down — exactly antirez's Q2 file. Q4_K is not a
+tuning target; it needs route 2 written. So the working artifact is Q2, and the
+thing to fix first is Q2's blocker, which is an allocation, not a kernel:
+`CUDA model arena alloc failed for Q4_K (1792.00 MiB)` on `blk.10.kda_q.weight`.
