@@ -186,3 +186,40 @@ RESERVE_MB=2048` + `DS4_CUDA_Q8_F16_CACHE_MB=1024` +
 `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=512` + cache 920, global LRU):
 **63.78 t/s prefill, 1.63 t/s generation** against the 61.77 / 1.15 baseline —
 **prefill +3.3%, generation +42%**.
+
+## Reproducibility: the first run after strata's teardown fails; follow-on runs do not
+
+Every configuration above was tested again from a card verified free
+(`memory.used` = 1 MiB before the run), and the result is a protocol fact, not a
+config fact:
+
+- A GLM run that is the **first** run in a window, immediately after
+  `systemctl stop llmbox-strata`, fails with
+  `CUDA model arena alloc failed for q8_0 (1024.00 MiB chunk): out of memory`
+  at cache 288, 300, 500, 700, 920 and 1800, at arena chunks of 1024 and 256 MiB,
+  with and without `DS4_CUDA_Q8_F16_CACHE_MB`/`_RESERVE_MB` caps.
+- The **same binary and same flags** succeed as the second and third run in the
+  same window.
+
+Two default policy rungs were written and tested against this — a 1/24-of-card
+cap on the Q8→F16 staging cache and a 1/48-of-card reserve for 20–32 GiB cards
+(`cuda_q8_f16_cache_limit_bytes` / `cuda_q8_f16_cache_reserve_bytes`,
+`ds4_cuda.cu:1486`, `:1492`). Neither made the cold first run succeed, so both
+were reverted rather than shipped: an unmeasured policy change is not an
+optimization.
+
+**The accepted table, measured in a warm window** (a 288-expert run first, then
+the measured runs; card verified free at window start; guard ON, no
+`DS4_GLM_MEMORY_GUARD=0`; ctx 4096, 128 generated tokens;
+`~/claude-tmp/glm53-sweep-warmtable.txt`):
+
+| cache experts | prefill t/s | gen t/s | steady t/s | first token |
+|---:|---:|---:|---:|---:|
+| 288 (default) | 62.07 | 1.15 | 1.15 | 873.1 ms |
+| 500 | 63.75 | 1.38 | 1.38 | 864.7 ms |
+| **920** | **63.78** | **1.43** | **1.44** | **820.8 ms |
+
+Generation at 920 measured 1.43, 1.44 and 1.43 in three separate windows, and
+1.63 once (`~/claude-tmp/glm53-sweep-abl2.txt`); the spread is window state, not
+cache size. Against the 61.77 / 1.15 baseline: **prefill +3.3%, generation
++24%**.
