@@ -187,6 +187,45 @@ RESERVE_MB=2048` + `DS4_CUDA_Q8_F16_CACHE_MB=1024` +
 **63.78 t/s prefill, 1.63 t/s generation** against the 61.77 / 1.15 baseline —
 **prefill +3.3%, generation +42%**.
 
+## Corrected: the rejected scan was still in the tree, and removing it is worth +20%
+
+The paragraph above says the per-layer patch was reverted. It was not. The
+ablation switch was removed but the victim scan itself stayed at
+`ds4_cuda.cu:27255`, so every run measured after commit `aaa23f0` — including
+the whole accepted table and the 1.43/1.44/1.43 decode rows — ran with the
+rejected policy active. The notes drifted from the tree.
+
+Removed in this commit (`ds4_cuda.cu`, one hunk, back to main's global-LRU
+scan), and measured A/B across two separate binaries in one window, card
+verified free at window start, guard on, ctx 4096, 128 generated tokens,
+`~/claude-tmp/glm53-ab-plrev2.txt`:
+
+| binary | cache experts | prefill t/s | gen t/s | first token |
+|---|---:|---:|---:|---:|
+| `ds4-bench-plon` (scan present) | 1200 | 63.69 | 1.47 | 798.0 ms |
+| **`ds4-bench-ploff` (scan removed)** | **1200** | **63.48** | **1.76** | **796.0 ms** |
+| `ds4-bench-ploff` (scan removed) | 920 | 63.39 | 1.64 | 816.5 ms |
+| `ds4-bench-plon` (scan present) | 920 | 63.70 | 1.43 | 821.8 ms |
+
+Decode **1.47 → 1.76 t/s at cache 1200 (+20%)** and **1.43 → 1.64 at cache 920
+(+15%)**, prefill flat within 0.5%. This reproduces the ablation-switch A/B
+(1.44 on vs 1.63 off at 920) with two independent binaries, which is what
+settles it.
+
+Why the removal cannot change output: eviction decides *which resident slot is
+overwritten*, never *which experts are computed*. Every requested expert is
+loaded before its kernel runs, whether from a slot hit or from the SSD tier. The
+first-token times agree within 2 ms and prefill within 0.5%, which is what
+output-identical work looks like here. The cache-size fixture evidence points
+the same way: the Z.AI FP8 20-case score is identical at cache 288 and cache
+1200 (`avg_nll=0.468912094`, 2455 tokens,
+`~/claude-tmp/glm53-fixture-acc.txt`).
+
+**New best accepted configuration**: guard rung + `DS4_CUDA_STREAM_EXPERT_RESERVE_
+MB=2048` + `DS4_CUDA_Q8_F16_CACHE_MB=1024` + `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=512`
++ cache 1200 + global LRU → **63.48 t/s prefill, 1.76 t/s generation** against
+the 61.77 / 1.15 baseline: **prefill +2.8%, generation +53%**.
+
 ## Reproducibility: the first run after strata's teardown fails; follow-on runs do not
 
 Every configuration above was tested again from a card verified free
