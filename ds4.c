@@ -44925,6 +44925,19 @@ static double glm_graph_memory_guard_default_reserve_gib(
          * resident-Q2 budget without imposing it on larger machines. */
         return 18.0;
     }
+    if (base_gib < 108.0) {
+        /* Discrete-GPU hosts: a 24 GB card reports a ~23.5 GiB base, where the
+         * 32 GiB fallback reserve exceeds the base entirely and collapses the
+         * budget to zero (ds4.c:44941), which zeroes the streaming expert cache
+         * and leaves decode streaming every expert. Scale the reserve to the
+         * base instead. Lever 1 of the GLM 5.3 work on branch
+         * glm53-flash-3090 (commit 5a697a8, docs/GLM53_DS4_LEVERS.md there):
+         * measured GLM 5.3 Flash Q2 decode 1.15 -> 1.44 t/s on this card. The
+         * condition is the card's size, not the model, so it is picked here for
+         * the DeepSeek streaming path and measured separately. */
+        const double scaled = base_gib / 8.0;
+        return scaled < 2.0 ? 2.0 : scaled;
+    }
     return 32.0;
 }
 
