@@ -87,12 +87,32 @@ draft compute) is ~8% of a single token. With k=4 at 27.5% acceptance, expected
 accepted tokens ≈ 1.1, so gross speedup ≈ 2.1× and net ≈ 1.9× — 1.76 → **~3.4
 t/s** if ds4 verifies drafted tokens in parallel.
 
-**Two assumptions in that number are not measured, and they are the ones that
-can kill it:** (a) the drafter's own tokens/second on a 24 GB M4 Max, and (b)
-that ds4's V4 verify path accepts externally-supplied drafts and verifies them
-in one pass. (b) is a code question with a definite answer and should be checked
-before any Mac-side work. If ds4 cannot verify an external draft, the whole
-drafter idea is dead on this box regardless of the network.
+**Assumption (b) is now answered, and the answer is no.** ds4 has no path for an
+externally-supplied draft:
+
+- `--mtp` and `--dspark` are parsed at `ds4_cli.c:2019` and `ds4_cli.c:2030`, and
+  both select a drafter that runs **in the same process** as the verifier.
+- DSpark is loaded as a support artifact and described by model metadata —
+  `DS4_SUPPORT_DSPARK` and the `deepseek4.dspark.*` keys read in
+  `model_dspark_summary()` at `ds4.c:3016` — not received over the wire.
+- `ds4_server.c` has no endpoint that takes proposed token ids. Grepping it for
+  draft/speculation surfaces only `decode_speculative` (an internal flag) and
+  unrelated uses of the word "spec".
+- `./ds4 --help` (77 lines) exposes no flag accepting foreign drafts.
+
+So the drafter-coprocessor idea is a **no-go on the current code**, and the
+reason is architectural, not the network: the verifier has no entry point for
+proposals from another machine. The favourable latency arithmetic above is
+therefore never spent, and assumption (a) — the drafter's own tokens/second on
+the M4 Max — does not need measuring.
+
+The cost to change that, stated so it can be declined knowingly: a draft-ingestion
+path is a server endpoint taking proposed token ids plus the acceptance and
+rollback handling in `ds4.c` around the existing speculative path. That is
+implementation work in ds4, not a configuration change, and it is out of scope
+for a report-only study. If it is ever built, the network is not the binding
+constraint — 5.3 ms RTT against a 568 ms verifier token is 1%. The binding
+constraint is the work itself.
 
 ## iPad Air M4 (12 GB) — verdict
 
@@ -122,11 +142,18 @@ Ranked by what it costs to get:
    naming because it is the cheapest path to *running this model well* — it is
    just not a coprocessor, and it is not this box.
 
-## Recommended next step, and its cost
+## Status: closed
 
-Check assumption (b) first: read ds4's V4 speculative-decoding path
-(`docs/SPECULATIVE_DECODING.md`, the DSpark handling in `ds4.c`) and answer
-whether an external drafter can feed it drafts at all. That is a read-only code
-question, costs one sitting, and decides whether any Mac-side work is worth
-proposing. If the answer is no, this study closes with "drafter: no-go, and
-here is why" and nothing further is spent.
+The study's one open question is answered and the answer is no, so no Mac-side
+work is proposed and nothing further is spent on it.
+
+| Machine | Host | Remote expert tier | TP peer | Pipeline stage | Drafter host |
+|---|---|---|---|---|---|
+| M4 Max, 24 GB | no — 81 GB model | no — 29× slower than local NVMe | no — Mac+Mac, needs TB RDMA | possible, not worth it | **no — verifier has no draft ingestion path** |
+| iPad Air, 12 GB | no | no | no | no | **no — ds4 has no iOS target** |
+
+Both coprocessor roles that survive the bandwidth test die on software: the
+verifier cannot accept foreign drafts, and ds4 does not build for iPadOS. The
+M4 Max's real value to this goal is as the published 96/128 GB host for a
+*fatter* quant — a machine that runs DS V4 Flash well on its own, which is a
+different question from coprocessing and is not this box.
