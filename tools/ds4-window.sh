@@ -60,7 +60,23 @@ LOG_DIR=${DS4_WINDOW_LOGDIR:-/srv/models/gguf/ds4/window-logs}
 PROBE_TIMEOUT=${DS4_WINDOW_PROBE_TIMEOUT:-300}
 RUN_TIMEOUT=${DS4_WINDOW_TIMEOUT:-3600}
 RESTORE_TIMEOUT=${DS4_WINDOW_RESTORE_TIMEOUT:-300}
+# The restore can be REFUSED while gpud is still bringing the tenant up — measured
+# 04:24:02, http=503 {"error":{"message":"the strata tenant could not be
+# started","why":"demanding"}}. Asking once and giving up leaves the box short,
+# so it retries until it is served.
+RESTORE_TRIES=${DS4_WINDOW_RESTORE_TRIES:-4}
 WATCH_INTERVAL=${DS4_WINDOW_WATCH_INTERVAL:-1}
+# Strata's own readiness probe, the one gpud polls (vram-budget.json:989). 200
+# means the model is loaded and the engine can serve; the unit being "active" only
+# means the process launched, a minute before that.
+STRATA_HEALTH=${DS4_WINDOW_STRATA_HEALTH:-http://127.0.0.1:8090/health}
+# How long to let a strata load finish before sleeping the card. Sleeping DURING a
+# load stalls gpud: its start() keeps waiting out strata's start_deadline_secs of
+# 300 (vram-budget.json:997) for an engine sleep has already stopped, and no new
+# start can happen until it gives up. Measured: start 04:31:50, sleep 04:32:40,
+# "never became healthy" 04:36:50, strata down the whole time. A load takes ~60 s,
+# so waiting it out is the cheap side of that trade.
+SETTLE_TIMEOUT=${DS4_WINDOW_SETTLE_TIMEOUT:-180}
 
 HARNESS_PID=$$
 BENCH_LEADER=""
@@ -109,25 +125,59 @@ kick_restore() {
 
 # The restore itself, shared by every path (the normal exit, and the watchdog's
 # path when this shell was killed). Detached: the engine takes 40-70 s to load and
-# nobody should be made to wait on it, because gpud is already awake and the card
-# is already back. Prints the log path.
+# nobody should be made to wait on it, because gpud is already awake and the card is
+# already back.
+#
+# Success is a SERVED completion (http=200), and the request is left to finish:
+# gpud holds it open while strata loads and answers when the engine can, which
+# has been measured at up to 2m13s. An earlier version cut its own request off the
+# moment the unit went "active" — a launched process, not a loaded model — and its
+# follow-up check then got 429 from an engine still loading.
+#
+# Retries, because gpud answers 503 while a start is still failing or stalled
+# (04:24:02, 04:32:40: "the strata tenant could not be started"). A 429 with
+# strata's own /health at 200 means the engine is up and busy serving someone
+# else, which is restored for every purpose that matters.
+#
+# One restore at a time, under a lock. The trap and the watchdog can both fire on
+# one window, and restores left over from earlier windows were measured piling up
+# three deep, each re-asking for strata; the lock is also what tells the NEXT
+# window that a restore is still in flight (settle_before_sleep).
 do_restore() {
     local stamp=${1:-$(date +%Y%m%d-%H%M%S)}
     RESTORE_LOG="$LOG_DIR/restore-$stamp.log"
     setsid bash -c '
-        url=$1; model=$2; out=$3; tmo=$4
-        # Record the attempt BEFORE the call: the request blocks while the engine
-        # loads (40-70 s), and if this process is killed in the meantime the log
-        # stays empty and a window looks like it never asked. Measured 04:21.
-        printf "%s issued pid=%s\\n" "$(date -Is)" "$$" >>"$out"
-        code=$(curl -s --max-time "$tmo" -o "${out}.body" -w "%{http_code}" \
-            -H "Content-Type: application/json" \
-            -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}" \
-            "${url}/v1/chat/completions" 2>/dev/null)
-        printf "%s http=%s %s\\n" "$(date -Is)" "${code:-none}" \
-            "$([ -s "${out}.body" ] && echo body=yes || echo body=no)" >>"$out"
-    ' _ "$GPUD_URL" "$GPUD_MODEL" "$RESTORE_LOG" "$RESTORE_TIMEOUT" \
-        >/dev/null 2>&1 </dev/null &
+        url=$1; model=$2; out=$3; tmo=$4; tries=$5; health=$6; lock=$7
+        log() { printf "%s %s\\n" "$(date -Is)" "$*" >>"$out"; }
+        healthy() { [ "$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "$health" 2>/dev/null)" = 200 ]; }
+        exec 9>"$lock"
+        if ! flock -n 9; then
+            log "another restore holds $lock; leaving strata to that one"
+            exit 0
+        fi
+        log "issued pid=$$ tries=$tries model=$model"
+        i=0; ok=0
+        while [ "$i" -lt "$tries" ]; do
+            i=$(( i + 1 ))
+            code=$(curl -s --max-time "$tmo" -o "${out}.body" -w "%{http_code}" \
+                -H "Content-Type: application/json" \
+                -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}" \
+                "${url}/v1/chat/completions" 2>/dev/null)
+            log "request $i: http=${code:-none} body=$([ -s "${out}.body" ] && echo yes || echo no)"
+            if [ "$code" = 200 ]; then ok=1; break; fi
+            if [ "$code" = 429 ] && healthy; then
+                log "strata is loaded and busy with another caller: restored"
+                ok=1; break
+            fi
+            sleep 10
+        done
+        if [ "$ok" = 1 ]; then
+            log "RESTORED: strata served a completion"
+        else
+            log "WARN strata not serving after $tries request(s); see journalctl -u llmbox-gpud"
+        fi
+    ' _ "$GPUD_URL" "$GPUD_MODEL" "$RESTORE_LOG" "$RESTORE_TIMEOUT" "$RESTORE_TRIES" \
+        "$STRATA_HEALTH" "$LOG_DIR/.restore.lock" >/dev/null 2>&1 </dev/null &
     printf '%s\n' "$RESTORE_LOG"
 }
 
@@ -178,11 +228,45 @@ start_watchdog() {
     say "watchdog $WATCHDOG_PID (own session): wakes gpud within ${WATCH_INTERVAL}s of the bench exiting, kills the bench and restores strata if this shell is killed; decisions -> $wlog"
 }
 
+strata_health() {
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "$STRATA_HEALTH" 2>/dev/null)
+    printf '%s\n' "${code:-000}"
+}
+
+# Wait for the card to settle before sleeping it, or refuse without touching it.
+# Two things make the card unsettled, both measured to strand strata if a sleep
+# lands on them: a restore from an earlier window still in flight (it holds the
+# restore lock), and a strata load in progress (unit active, /health not yet 200).
+# Sleeping on either leaves gpud waiting out a 300 s start deadline with strata
+# down — see SETTLE_TIMEOUT above.
+settle_before_sleep() {
+    local waited=0 busy
+    while :; do
+        busy=""
+        if ! flock -n "$LOG_DIR/.restore.lock" true 2>/dev/null; then
+            busy="a restore from an earlier window is still in flight"
+        elif [ "$(systemctl is-active "$STRATA_UNIT" 2>/dev/null)" = active ] &&
+             [ "$(strata_health)" != 200 ]; then
+            busy="strata is still loading ($STRATA_HEALTH not 200 yet)"
+        fi
+        [ -z "$busy" ] && break
+        if [ "$waited" -ge "$SETTLE_TIMEOUT" ]; then
+            die "card did not settle in ${SETTLE_TIMEOUT}s ($busy) — NOT sleeping it; nothing was touched"
+        fi
+        [ "$waited" = 0 ] && say "waiting for the card to settle before sleeping: $busy"
+        sleep 5
+        waited=$(( waited + 5 ))
+    done
+    [ "$waited" -gt 0 ] && say "card settled after ${waited}s"
+    return 0
+}
+
 # --- status / floor: both need no card ---------------------------------------
 do_status() {
     local newest
     newest=$(ls -t "$LOG_DIR"/restore-*.log 2>/dev/null | head -1)
-    echo "gpud:    $(systemctl is-active "$STRATA_UNIT" 2>/dev/null | sed 's/^/strata=/' ) $(systemctl is-active llmbox-gpud 2>/dev/null | sed 's/^/gpud=/')"
+    echo "gpud:    $(systemctl is-active "$STRATA_UNIT" 2>/dev/null | sed 's/^/strata=/' ) $(systemctl is-active llmbox-gpud 2>/dev/null | sed 's/^/gpud=/') strata-health=$(strata_health)"
     echo "sleeping: $("$GPU_SH" json 2>/dev/null | sed -n 's/.*"sleeping": *\([a-z]*\).*/\1/p' | head -1)"
     if [ -n "$newest" ]; then
         echo "restore: $(tail -1 "$newest")  ($newest)"
@@ -361,6 +445,7 @@ else
 fi
 
 # --- the window ---------------------------------------------------------------
+settle_before_sleep
 say "sleeping gpud (gpud stops strata and frees its VRAM and RAM)"
 open_window
 "$GPU_SH" sleep || die "gpu.sh sleep failed"
