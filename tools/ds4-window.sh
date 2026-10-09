@@ -77,6 +77,9 @@ STRATA_HEALTH=${DS4_WINDOW_STRATA_HEALTH:-http://127.0.0.1:8090/health}
 # "never became healthy" 04:36:50, strata down the whole time. A load takes ~60 s,
 # so waiting it out is the cheap side of that trade.
 SETTLE_TIMEOUT=${DS4_WINDOW_SETTLE_TIMEOUT:-180}
+# How long the window holds its caller, after the card is already back, for strata
+# to answer /health. See hold_for_strata for why the caller must not run ahead.
+STRATA_WAIT=${DS4_WINDOW_WAIT_STRATA:-240}
 
 HARNESS_PID=$$
 BENCH_LEADER=""
@@ -106,6 +109,34 @@ wake() {
     "$GPU_SH" wake || say "WARN gpu.sh wake failed (rc=$?)"
     kick_restore
     say "gpud awake. strata restore requested; check it with: $0 --status"
+    hold_for_strata
+}
+
+# Hold the CALLER, not the card, until strata can answer. By the time this runs
+# gpud is awake and the restore is already asking for strata, so nothing here
+# delays giving the card back. What it delays is the caller's next move, and for an
+# agent running on the local model that next move is a chat to strata.
+#
+# Why that matters, measured 04:56: a pi agent on the local model made its first
+# call while strata was still loading, and gpud refused it in 4 ms with
+# "strata: refusing, 26091 MiB short of host RAM" — the RAM strata had already
+# pinned for itself, counted as missing (gpud.py ensure_up, the _ram_short gate
+# after the healthy() check). pi retried for 17 s and gave up at 04:56:27; strata
+# was ready at 04:56:47. Until that gate is fixed in gpud, returning before
+# /health answers 200 hands the agent a model that turns it away.
+# DS4_WINDOW_WAIT_STRATA=0 skips the hold, for callers that are not on strata.
+hold_for_strata() {
+    [ "$STRATA_WAIT" -gt 0 ] || return 0
+    local waited=0
+    while [ "$(strata_health)" != 200 ]; do
+        if [ "$waited" -ge "$STRATA_WAIT" ]; then
+            say "WARN strata not answering after ${STRATA_WAIT}s; returning anyway (restore log: ${RESTORE_LOG:-none})"
+            return 0
+        fi
+        sleep 2
+        waited=$(( waited + 2 ))
+    done
+    say "strata answering /health after ${waited}s; the local model is back"
 }
 open_window() {
     trap 'wake $?' EXIT
@@ -464,6 +495,19 @@ fi
 
 STAMP=$(date +%Y%m%d-%H%M%S)
 LOG="$LOG_DIR/$STAMP.log"
+# The window state goes into the log beside the numbers it produced, so a result
+# read back later says whether the card was really empty when it was measured.
+# Lines start with "# " so the bench's CSV rows can still be pulled out cleanly.
+{
+    echo "# window $STAMP"
+    echo "# command: $DS4 ${ARGS[*]}"
+    echo "# env: $(env | grep -E '^DS4_' | grep -v '^DS4_WINDOW_' | tr '\n' ' ')"
+    echo "# gpud sleeping: $("$GPU_SH" json 2>/dev/null | sed -n 's/.*"sleeping": *\([a-z]*\).*/\1/p' | head -1)"
+    echo "# $STRATA_UNIT: $(systemctl is-active "$STRATA_UNIT" 2>/dev/null)"
+    echo "# vram used/free MiB: $(nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')"
+    echo "# host MemAvailable kB: $(awk '/^MemAvailable/{print $2}' /proc/meminfo)"
+    echo "# prompt: $PROMPT (${PROMPT_SEEN:-?} tokens)"
+} >"$LOG"
 say "card is free; bench starting -> $LOG"
 
 # The bench gets its own session so the watchdog can kill exactly it and never the
@@ -474,7 +518,7 @@ say "card is free; bench starting -> $LOG"
 PGIDFILE="$LOG_DIR/$STAMP.pgid"
 rm -f "$PGIDFILE"
 setsid -w bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$PGIDFILE" \
-    timeout -k 30 "$RUN_TIMEOUT" "$DS4" "${ARGS[@]}" >"$LOG" 2>&1 &
+    timeout -k 30 "$RUN_TIMEOUT" "$DS4" "${ARGS[@]}" >>"$LOG" 2>&1 &
 BENCH_LEADER=$!
 BENCH_PGID=""
 for _ in $(seq 1 25); do
