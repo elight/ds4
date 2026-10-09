@@ -1,103 +1,130 @@
 # The bench window harness
 
-`tools/ds4-window.sh`, rewritten 2026-10-09 after three failures in one evening.
-This file is the failure matrix and the contract; the script is the fix.
+`tools/ds4-window.sh`. Rewritten 2026-10-09 after the failures below, each
+reproduced and then fixed. This file is the failure matrix, the proofs, and
+ds4-bench's own contract; the script is the fix.
 
 ## Why a window has to be short and sure
 
 When pi runs the local model (`~/.pi/agent/settings.json`: `defaultProvider=gpud`,
 `defaultModel=swift-1.5-iq3_xxs`), strata **is the agent's brain**. Sleeping gpud to
-free the card stops the agent's own inference, so the agent cannot act again until
-the card is back — it cannot notice the bench crashed, cannot wake anything, cannot
-even report that it is stuck. Every choice below follows from that one fact.
+free the card stops the agent's own inference, so for the length of the window the
+agent cannot notice a crash, wake anything, or say that it is stuck. Whatever ends
+the window has to give the card back by itself.
 
-## What went wrong, measured
+## Who stops and starts what
 
-| # | Failure | Mechanism | Evidence |
-| --- | --- | --- | --- |
-| 1 | A prompt below the floor was discovered **after** the card was slept | `ds4-bench` requires prompt tokens >= `ctx_max` (+ `gen_tokens` when teacher-forced), `ds4_bench.c:745`. A 90820-byte prompt is 16690 tokens | `ds4-bench: prompt has 16690 tokens, need at least 32768`, exit 1, after `gpu.sh sleep` had already stopped strata |
-| 2 | `kill -9` on the harness skipped the trap, and an orphaned bench held the card for 59 s | SIGKILL runs no shell trap. The bench is a separate process and outlived the shell that started it | First kill test: gpud stayed asleep until the bench finished on its own, 59 s later |
-| 3 | The exit path slept for 150 s and could never have succeeded | It polled `systemctl is-active llmbox-strata`. gpud does **not** start strata on wake — it starts it when a request arrives | `/gpu/wake` at 04:00:25 with no job waiting: strata still inactive 200 s later. Both observed starts (03:54:21, 03:55:54) followed an arriving job |
-| 4 | The hygiene check matched **pgrep** | `pgrep -f "$DS4"` matches any process whose argv contains the path — including a concurrent pgrep, whose argv *is* the pattern | The harness refused a window because `824487 pgrep -f /tmp/watchtest/stub-bench.sh` was in the table. Chased as a phantom bench for a whole test cycle |
-| 5 | The process-group kill did not land, and nothing recorded why | The first watchdog resolved the bench's group with `pgrep -P`. The group kill never took effect and the bench survived. That version logged nothing, so the cause is unproven | Stub bench and its `timeout` parent alive after the watchdog had already woken gpud; no log to say which kill ran |
-| 6 | The restore's outcome log stayed empty | The chat blocks while the engine loads (40-70 s); a process killed in that window wrote nothing, so a window looked like it never asked | `restore-20261009-042012.log` absent while gpud's journal showed the request arriving at 04:21:35 |
+gpud is the single writer for VRAM tenancy and the only thing on this box with the
+sudo to touch tenant units.
 
-## The design: two wake paths, deliberately overlapping
+| Route | What it does | Source |
+| --- | --- | --- |
+| `gpu.sh sleep` | gpud stops every running tenant: strata's 22.4 GB of VRAM and 52.9 GiB of RAM are released | `gpud.py:2884` |
+| `gpu.sh wake` | gpud reopens the card. It does **not** start strata | `gpud.py:4481` |
+| a chat to `swift-1.5-iq3_xxs` | gpud starts strata on demand and holds the request until it is served | `gpud.py:2944`, `gpud.py:3136` (`ensure_up`) |
 
-```text
-trap on EXIT/INT/TERM   fires in the same second the bench exits
-detached watchdog       survives SIGKILL; bench gone -> wake gpud;
-                        harness gone -> kill the bench group, then wake gpud
-```
+A plain `systemctl start llmbox-strata` from an agent shell fails with
+`Interactive authentication required`, so the harness calls `gpu.sh` and sends a
+chat, and nothing else.
 
-Both also issue the restore, so a window that is killed still leaves strata coming
-back. A double wake is harmless: gpud's routes are idempotent.
+## The failure matrix
 
-The four rules that came out of the failures:
+Every way a window can end or go wrong, what used to happen, and what happens now.
+"Proof" names the measurement in the next section.
 
-1. **Nothing sleeps in the exit path.** gpud is woken, the restore is issued
-   detached, and the shell exits. The window is never longer than the bench.
-2. **The wake survives being killed.** A watchdog in its own session, because a
-   SIGKILLed shell cannot run a trap and a trap is therefore not a guarantee.
-3. **The bench's process group is known, not guessed.** The session leader writes
-   its own PID; that PID *is* the group. `kill` decisions are logged with statuses.
-4. **Strata comes back the way it actually comes back.** gpud is the single writer
-   for VRAM tenancy (`gpud.py:2884` stops tenants, `gpud.py:2944` starts them) and
-   it is the only thing on this box with the sudo to touch tenant units, so the
-   harness calls `gpu.sh` and nothing else — a plain `systemctl start
-   llmbox-strata` from an agent shell fails with `Interactive authentication
-   required`. And because gpud starts strata on demand, the restore is a real
-   request (a 1-token completion to `swift-1.5-iq3_xxs`), not a status poll.
+| Way it ends | What went wrong before | Mechanism | What happens now | Proof |
+| --- | --- | --- | --- | --- |
+| Prompt below the floor | Found **after** the card was slept; window wasted | `ds4_bench.c:745` needs prompt tokens >= `ctx_max`; a 90820-byte prompt is 16690 tokens | Refused before the card is touched, from a token count cached beside the prompt (size + sha256) | P1 |
+| Clean exit | Exit path polled `systemctl is-active` for 150 s and could never succeed | gpud starts strata on a request, not on wake (wake 04:00:25, strata inactive 200 s later) | Trap wakes gpud the same second; a detached restore sends the chat | P2 |
+| Bench crash | Same 150 s tail | Same | Same trap; covered with fakes for SIGSEGV | P3 |
+| Bench never starts | Same | Same | Same trap, exit 127 | P3 |
+| Bench hangs | Nothing stopped it | No run limit | `timeout` ends it (default 3600 s); trap wakes gpud | P3 |
+| Sleep call fails | Script died without waking | `die` with no trap | Trap is armed before the sleep, so a failed sleep still wakes | P3 |
+| Harness `kill -9` | Trap skipped; orphaned bench held the card for its remaining 59 s | SIGKILL runs no trap; the bench outlived its shell | Watchdog in its own session sees the harness gone, kills the bench, wakes gpud, restores | P4 |
+| Tool-timeout group kill | Same as `kill -9` | Same | Bench runs in its own session, so the group kill misses it; the watchdog catches it | P5 |
+| Sleep lands while strata is loading | Strata down for minutes | gpud's `start()` waits out strata's 300 s start deadline (`vram-budget.json:997`) for an engine the sleep stopped; start 04:31:50, sleep 04:32:40, "never became healthy" 04:36:50 | Window waits for strata's `/health` to answer 200 before sleeping; refuses after 180 s without touching the card | P6, P7 |
+| A restore from an earlier window still in flight | Restores piled up three deep, each re-asking for strata, and one fought the next window's sleep (503 "could not be started") | No coordination between windows | Restores run under a lock; one at a time; the next window waits for it | P6, P7 |
+| A bench already running | Second window would fight the first | — | Refused, naming the process it found | P8 |
+| The hygiene check matched itself | Windows refused over a phantom bench | `pgrep -f` matches any argv containing the path, pgrep's own included | Only real bench processes count | P8 |
+| The restore counted "unit active" as done | Follow-up got 429 from an engine still loading | Active means launched, ~60 s before loaded | Success is a served completion (http=200); 429 counts only with `/health` at 200 | P2 |
 
 ## Measured proofs
 
-**Watchdog, hermetic** — no GPU, no gpud, stubbed bench/gpu.sh/gpud, harness SIGKILLed
-(`/tmp/watchtest.sh`). The watchdog's own log, verbatim:
+Times in the "gpud" column are gpud's own journal lines, `journalctl -u
+llmbox-gpud`.
 
-```text
-04:19:51.659 watchdog start: harness=834093 leader=834131 pgid=834131
-04:19:52.661 harness 834093 gone -> TERM bench group -834131
-04:19:52.662   TERM rc=0
-04:19:52.663   bench gone after TERM
-04:19:52.664 waking gpud
-04:19:52.668   wake rc=0
-04:19:52.674   restore rc=0
-04:19:52.675 watchdog done
-```
-
-Bench killed **0.59 s** after the kill, wake at **0.62 s**, restore at **0.64 s**,
-no leftover processes. This is the 59-second stranding from failure 2, now under a
-second.
-
-**A real window** (ctx 4096, gen 32, `--ssd-streaming`):
-
-```text
-04:21:30 ds4-window: bench rc=0 log=/srv/models/gguf/ds4/window-logs/20261009-042012.log
-04:21:30 ds4-window: bench gone (rc=0) -> waking gpud
-04:21:30 ds4-window: gpud awake. strata restore requested; check it with: --status
-```
-
-Same second, and gpud's own journal agrees: `gpud waking up` 04:21:30,
-`starting strata (24126 MiB free)` 04:21:31, the completion POST at 04:21:35.
-strata was active again ~5 s after the window ended. Whole window 1m20s: prefill
-106.90 t/s at 2048 and 134.58 at 4096, decode 1.50 and 1.49 t/s.
-
-**The floor abort** — the 16690-token file against a 32768 floor:
+**P1 — floor refused before the card.** The 16690-token prompt against a 32768
+floor:
 
 ```text
 ds4-window: prompt has 16690 tokens, the bench needs 32768 — the card was NOT touched
-rc=2, and 0 /gpu/sleep or /gpu/wake calls on the journal
+rc=2; 0 /gpu/sleep or /gpu/wake calls on gpud's journal since the attempt
 ```
 
-The claim is checked by counting gpud's own control calls, not by trusting the
-script's message.
+**P2 — clean exit on the card** (ctx 2048, gen 16, `--ssd-streaming`):
 
-**Restore on demand** — gpud awake plus a 1-token chat: strata active at t+55 s
-from a cold start (`restore-*.log`: `http=200 body=yes`).
+| Event | Time | Source |
+| --- | --- | --- |
+| gpud going to sleep | 04:42:01 | gpud |
+| bench rc=0 | 04:42:32 | harness |
+| gpud waking up | 04:42:32 | gpud |
+| starting strata | 04:42:32 | gpud |
+| strata ready | 04:43:22 | gpud |
+| restore served, http=200 | 04:43:24 | `restore-20261009-044201.log` |
+
+Wake in the same second as the exit; the local model answering 52 s after it.
+
+**P3 — the other exit paths, with fakes** (`tools/window-tests/matrixtest.sh`: stub bench, stub
+`gpu.sh`, stub gpud; no card):
+
+| Case | Harness exit | gpu.sh calls | Wake after the window opened | Bench left |
+| --- | --- | --- | --- | --- |
+| clean exit | 0 | sleep, wake | 0.06 s | 0 |
+| bench crash (SIGSEGV) | 139 | sleep, wake | 1.15 s | 0 |
+| bench never starts | 127 | sleep, wake | 0.05 s | 0 |
+| bench hangs (limit 3 s) | 124 | sleep, wake | 3.05 s | 0 |
+| sleep call fails | 2 | sleep, wake | 0.04 s | 0 |
+
+**P4 — `kill -9` on the harness only, on the card** (`tools/window-tests/realkill.sh sock`; with fakes, `tools/window-tests/watchtest.sh`). The watchdog's own log:
+
+```text
+04:46:03.338 watchdog start: harness=912715 leader=914298 pgid=914298
+04:46:12.346 harness 912715 gone -> TERM bench group -914298
+04:46:12.850   bench gone after TERM
+04:46:12.945   wake rc=0
+```
+
+gpud journal: `gpud waking up` 04:46:12. Restore served http=200 at 04:47:06. No
+bench left.
+
+**P5 — process-group kill, on the card** (`tools/window-tests/realkill.sh group`, what a tool timeout does): bench gone
+0.56 s after the kill, gpud awake 0.97 s after it; gpud journal `gpud waking up`
+04:45:06; restore served http=200 at 04:45:59.
+
+**P6 — the settle wait, on the card.** The window after P5 started while P5's
+restore was still loading strata:
+
+```text
+04:45:16 ds4-window: waiting for the card to settle before sleeping: a restore from an earlier window is still in flight
+04:46:01 ds4-window: card settled after 45s
+```
+
+P5's restore was served at 04:45:59; the next sleep landed at 04:46:03. Nothing
+was stranded.
+
+**P7 — settle and the restore lock, with fakes** (`tools/window-tests/settletest.sh`): with the
+restore lock held, a window refused after 10 s with **0** gpu.sh calls; two
+restores started together sent **one** request, and the second logged that it
+stood down.
+
+**P8 — hygiene.** A bench already running is refused with the matching process
+printed. The check that once matched its own `pgrep` now excludes it; the
+phantom it produced (`824487 pgrep -f /tmp/watchtest/stub-bench.sh`) no longer
+blocks a window.
 
 ## ds4-bench's contract, from the source
 
-Each reference opened and verified, not recalled:
+Each reference opened and checked:
 
 | Fact | Reference |
 | --- | --- |
@@ -106,34 +133,32 @@ Each reference opened and verified, not recalled:
 | Defaults: `ctx_start` 2048, `ctx_max` 32768, `gen_tokens` 128 | `ds4_bench.c:220`, `:221`, `:223` |
 | `DS4_CUDA_STREAM_EXPERT_RESERVE_MB` lowers the streaming reserve; default 8 GiB | `ds4_cuda.cu:27198`, `:27199` |
 | `DS4_CUDA_Q8_F16_CACHE_MB` bounds the Q8->F16 staging cache | `ds4_cuda.cu:1488` |
-| The cache size the run actually chose prints as `CUDA SSD expert cache: N slots, X GiB` | `ds4_cuda.cu:27225` |
+| The cache the run chose prints as `CUDA SSD expert cache: N slots, X GiB` | `ds4_cuda.cu:27225` |
 | On a 24 GB card the guard reserve scales to `base_gib / 8` (from `5a697a8`) | `ds4.c:44938` |
 
 ## Usage
 
 ```bash
-# a window: the harness checks the floor, sleeps gpud, runs the bench, wakes gpud,
-# issues the restore, and exits
+# a window: check the floor, wait for the card to settle, sleep gpud, run the
+# bench, wake gpud, send the restore chat, exit
 ~/claude-tmp/ds4-window.sh --cuda -m "$MODEL" --prompt-file /tmp/bench-prompt-32k.txt \
     --ssd-streaming --ctx-max 32768 --gen-tokens 128
 
-# the floor without touching the card
-~/claude-tmp/ds4-window.sh --floor /tmp/bench-prompt-32k.txt
-
-# what the last window left behind
-~/claude-tmp/ds4-window.sh --status
+~/claude-tmp/ds4-window.sh --floor /tmp/bench-prompt-32k.txt   # no card needed
+~/claude-tmp/ds4-window.sh --status                            # strata, gpud, last restore
+~/claude-tmp/ds4-window.sh --restore                           # ask gpud for strata now
 ```
 
-A verified token count is cached beside the prompt (`.floor`, keyed on size +
-sha256), so the count is probed once and later windows need no card for it. An
-unrecorded prompt is probed inside the window before the bench does any work.
+A prompt with no recorded count is probed once inside the window, before the
+bench does any work, and the count is cached for later windows.
 
-Env overrides: `DS4_WINDOW_T0KENS` (`DS4_WINDOW_TOKENS`, default 32800),
-`DS4_WINDOW_BAND` (120), `DS4_WINDOW_BPT` (5.4427), `DS4_WINDOW_CORPUS`,
-`DS4_WINDOW_TIMEOUT` (3600), `DS4_WINDOW_RESTORE_TIMEOUT` (300),
-`DS4_WINDOW_WATCH_INTERVAL` (1), `DS4_WINDOW_LOGDIR`
-(`/srv/models/gguf/ds4/window-logs`), `GPU_SH`, `DS4`, `GPUD_URL`, `GPUD_MODEL`.
+Each window writes the bench log (`<stamp>.log`), the restore log
+(`restore-<stamp>.log`) and the watchdog's decisions (`watchdog-<stamp>.log`) to
+`/srv/models/gguf/ds4/window-logs`.
 
-Each window writes three files: the bench log (`<stamp>.log`), the restore log
-(`restore-<stamp>.log`, with the attempt and the outcome) and the watchdog's
-decisions (`watchdog-<stamp>.log`).
+Overrides: `DS4_WINDOW_TOKENS` (32800), `DS4_WINDOW_BAND` (120),
+`DS4_WINDOW_BPT` (5.4427), `DS4_WINDOW_CORPUS`, `DS4_WINDOW_TIMEOUT` (3600),
+`DS4_WINDOW_RESTORE_TIMEOUT` (300), `DS4_WINDOW_RESTORE_TRIES` (4),
+`DS4_WINDOW_SETTLE_TIMEOUT` (180), `DS4_WINDOW_WATCH_INTERVAL` (1),
+`DS4_WINDOW_STRATA_HEALTH`, `DS4_WINDOW_LOGDIR`, `GPU_SH`, `DS4`, `GPUD_URL`,
+`GPUD_MODEL`, `STRATA_UNIT`.
